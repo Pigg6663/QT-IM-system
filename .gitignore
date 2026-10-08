@@ -1,0 +1,72 @@
+# ============================================================
+# Qt / qmake 编译产物
+# ============================================================
+# 目标文件与可执行文件
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.idb
+*.res
+
+# qmake 生成的 Makefile 与中间脚本
+Makefile
+Makefile.*
+*.Debug
+*.Release
+.qmake.stash
+object_script.*
+qrc_*.cpp
+moc_*.cpp
+moc_*.h
+moc_predefs.h
+ui_*.h
+*.moc
+
+# Qt 构建输出目录
+debug/
+release/
+build-*/
+*-build-*/
+bin/
+obj/
+rcc/
+
+# ============================================================
+# Qt Creator / IDE 个人配置（含本机绝对路径，不应提交）
+# ============================================================
+*.pro.user
+*.pro.user.*
+*.qmlproject.user
+*.qmlproject.user.*
+*.autosave
+*.qmlc
+*.jsc
+CMakeLists.txt.user*
+.vscode/
+.idea/
+*.swp
+*~
+
+# ============================================================
+# 运行时数据（服务端用户网盘目录，本地测试生成）
+# ============================================================
+userdata/
+Server/userdata/
+Client/userdata/
+
+# ============================================================
+# 其他
+# ============================================================
+*.log
+*.tmp
+Thumbs.db
+Desktop.ini
+.DS_Store
