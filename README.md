@@ -249,7 +249,6 @@ cd Client && qmake Client.pro && nmake
 
 ## 八、已发现的不足与改进方向
 
-这部分是作者对项目的主动复盘，也是后续迭代的路线图：
 
 **正确性缺陷（优先修复）**
 
@@ -279,23 +278,7 @@ cd Client && qmake Client.pro && nmake
 
 ---
 
-## 九、可考察的知识点
-
-| 知识点 | 项目对应实现 |
-|---|---|
-| TCP 粘包 / 半包 | 包头记录总长度，先读长度再读包体（含已知局限与改进方案） |
-| 为什么选择 TCP | 聊天与文件传输要求可靠、有序，TCP 自带可靠传输，适合自定义协议封装 |
-| 二进制协议 vs JSON | 自定义 PDU 紧凑高效、解析快、字段定长易对齐；代价是可读性差、`caData[64]` 扩展性受限 |
-| 单例模式 | `Client` / `Index` / `File` / `Server` / `MyTcpServer` / `operateDB` 均为单例：Meyers 局部静态变量（C++11 线程安全）+ `delete` 拷贝构造与赋值 |
-| 信号槽机制 | `readyRead → recvMsg` 异步收发、`disconnected → clineOffliine` 断线清理、`on_xxx_clicked` 自动连接 |
-| 断线处理 | `disconnected` 信号 → 数据库 `online` 置 0 → 从连接列表移除并 `deleteLater()` |
-| 服务端并发模型 | 单线程事件循环 + 非阻塞 IO（Qt 内部封装 select / epoll） |
-| 内存管理 | `malloc` / `free` 配对、谁创建谁释放、柔性数组、QObject 使用 `deleteLater()` |
-| 数据库访问 | `QSqlDatabase` + `QSqlQuery`，全局单例复用连接 |
-
----
-
-## 十、说明
+## 九、说明
 
 - 本仓库已通过 `.gitignore` 排除 `debug/`、`release/`、`Makefile*`、`moc_*`、`ui_*.h`、`*.o`、`*.exe`、`*.pro.user` 等编译产物与本机 IDE 配置，仅保留源码。
-- `项目总结.md` 是作者整理的中文面试复习文档，包含更详细的模块讲解与问答思路，可作为本 README 的补充阅读。
+
