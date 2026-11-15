@@ -357,6 +357,10 @@ powershell -ExecutionPolicy Bypass -File tests\test_security.ps1
 
 > 脚本默认按本机路径查找 Qt / MinGW / MySQL，可通过参数覆盖，例如
 > `-QtBin "D:\Qt\5.14.2\mingw73_64\bin" -MingwBin "D:\Qt\Tools\mingw730_64\bin"`。
+>
+> `test_security.ps1` 还需要用 `-ServerRoot` 指向**服务端进程的工作目录**
+> （即 `userdata/` 实际生成的位置）。否则"目录确实创建""越权目录未落盘"
+> 这类落盘断言会因为两边路径基准不同而失败——那是环境问题，不是服务端缺陷。
 
 ---
 
@@ -385,7 +389,7 @@ powershell -ExecutionPolicy Bypass -File tests\test_security.ps1
 关于第 9 项：Qt 的 `QSqlDatabase` 连接与创建它的线程绑定，不能跨线程共享。
 所以"直接加线程池"是错的，正确顺序是先做连接管理（每线程独立连接 / 连接池），再线程化业务——这个取舍本身值得展开讲。
 
-第 11、12 项是后期复查中发现的两处缺陷，详见 9.8。
+第 11、12 项是后期复查中发现的两处缺陷，详见 9.6。
 
 ### 9.2 健壮性：收包状态机（第 1 项）
 
@@ -560,6 +564,21 @@ bool MsgHandler::isOwnIdentity(const char* caClaimedName) const
 覆盖 `chat` / `addFriend` / `addFriendAgree` / `flushFriend` / `delFriend` 五处。
 聊天请求没有应答包，校验失败直接静默丢弃（不回应，避免给攻击者反馈）。
 
+⚠️ **`ADD_FRIEND_AGREE` 的 `caData` 语义与其余四类不同**，这是本节最容易踩的坑：
+
+| 消息 | `caData[0:32]` | `caData[32:64]` | 该校验哪一段 |
+|---|---|---|---|
+| `CHAT` / `ADD_FRIEND` / `FLUSH_FRIEND` / `DEL_FRIEND` | 当前用户 | 对方 | 前 32 字节 |
+| `ADD_FRIEND_AGREE` | **发起方（对方）** | **同意方（自己）** | **后 32 字节** |
+
+原因：客户端收到 `ADD_FRIEND_RESEND` 后是**原样沿用整段 `caData`**（里面是发起方）
+再补上自己的名字发出，所以"当前登录用户"落在后半段。若这里也按前半段校验，
+真实客户端"同意好友"会 100% 失败。
+
+更麻烦的是：手工构造测试包时如果把这两个字段写反，测试**反而会通过**——
+这就是"实现和测试同时错"的典型形态，只靠测试绿灯发现不了，必须回到
+真实客户端的发包路径去对照。这类一致性缺陷值得单独记一笔。
+
 `shareFile` 虽然没有身份字段，但源路径必须落在 `userdata/<会话登录名>/` 内（第 4 项的路径约束），
 已隐式绑定会话身份，且它不转发发送者姓名，因此**无法冒充**——不需要额外加字段。
 
@@ -617,4 +636,7 @@ bool MsgHandler::isOwnIdentity(const char* caClaimedName) const
 ## 十一、说明
 
 - 本仓库已通过 `.gitignore` 排除 `debug/`、`release/`、`Makefile*`、`moc_*`、`ui_*.h`、`*.o`、`*.exe`、`*.pro.user` 等编译产物与本机 IDE 配置，仅保留源码。
-- 数据库若从旧版本升级，请执行 [`sql/migrate_v2.sql`](sql/migrate_v2.sql)（加 `salt` 列、`pwd` 扩容、好友唯一键与去重）。
+- 数据库若从旧版本升级，请执行 [`sql/migrate_v2.sql`](sql/migrate_v2.sql)：
+  先补 `friend.id` 主键列，再加 `salt` 列、`pwd` 扩容、好友关系去重与唯一键。
+  旧版 `friend` 表只有 `(user_id, friend_id)` 两列，去重语句依赖 `id` 判重，
+  缺这一步会直接报 `Unknown column 'f1.id'`。

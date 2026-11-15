@@ -17,16 +17,21 @@ ALTER TABLE `user_info`
 ALTER TABLE `user_info`
     MODIFY `pwd` VARCHAR(64) NOT NULL;
 
--- 3) 好友关系去重（保留每组关系里 id 最小的一行）
+-- 3) 补 id 主键列。
+--    旧版 friend 表只有 (user_id, friend_id) 两列，没有 id；而下面的去重语句
+--    依赖 id 判断"保留哪一行"，缺这一步会直接报 Unknown column 'f1.id'。
+--    （若库里已有 id 列，跳过本步）
 ALTER TABLE `friend`
     ADD COLUMN `id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST;
+
+-- 4) 好友关系去重（保留每组关系里 id 最小的一行）
 DELETE f1 FROM `friend` f1
     INNER JOIN `friend` f2
     WHERE f1.`user_id` = f2.`user_id`
       AND f1.`friend_id` = f2.`friend_id`
       AND f1.`id` > f2.`id`;
 
--- 4) 加唯一约束，防止双方同时互加产生重复关系
+-- 5) 加唯一约束，防止同一方向重复插入
 ALTER TABLE `friend`
     ADD UNIQUE KEY `uk_friend_pair` (`user_id`, `friend_id`);
 

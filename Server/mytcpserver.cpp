@@ -48,10 +48,14 @@ void MyTcpServer::resend(char *caTarName, PDU *pdu)
     {
         return ;
     }
-    // 注意：必须按字符串内容比较。
-// 原实现依赖 char* 到 QString 的隐式 ASCII 转换来完成比较，逻辑上可行，
-// 但依赖隐式转换且要求 caData 已按 0 填充。这里改为显式 QByteArray 比较，消除歧义。
-    const QByteArray tarName(caTarName);
+    // 按 32 字节定长字段显式构造 QByteArray：
+    // 1) caData 里的用户名字段不保证以 '\0' 结尾（用户名恰好 32 字节时没有终止符），
+    //    直接 QByteArray(caTarName) 会 strlen 越界读栈上相邻字节；
+    // 2) 原实现写成 caTarName == m_strLoginName，依赖 char* 到 QString 的隐式
+    //    ASCII 转换来完成比较，逻辑上可行（Qt 提供 operator==(const char*, const QString&)
+    //    重载，做的是内容比较），但隐式转换 + 依赖 0 填充，可读性和健壮性都差，
+    //    这里改成显式按字节比较，消除歧义。
+    const QByteArray tarName(caTarName, int(qstrnlen(caTarName, 32)));
     for (const QPointer<MyTcpSocket>& sock : m_tcpSocketList)
     {
         if (sock.isNull())

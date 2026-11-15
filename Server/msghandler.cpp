@@ -216,8 +216,13 @@ PDU *MsgHandler::addFriendAgree()
     char caTarName[32]={'\0'};
     memcpy(caCurName,pdu->caData,32);
     memcpy(caTarName,pdu->caData+32,32);
-    // 身份校验：只能以自己名义同意好友申请，不能替别人同意
-    if (!isOwnIdentity(caCurName))
+    // 身份校验：只能以自己名义同意好友申请，不能替别人同意。
+    //
+    // 注意本消息 caData 的语义与前几类不同：它是 [发起方, 同意方]。
+    // 客户端收到 ADD_FRIEND_RESEND 后直接沿用原包 caData（发起方 + 自己），
+    // 所以"当前登录用户"落在 caTarName（后半段），不是 caCurName。
+    // 若在这里误校验 caCurName，真实客户端的同意流程会被一律拒绝。
+    if (!isOwnIdentity(caTarName))
     {
         return makeIdentityRejectRespond(ENUM_TYPE_ADD_FRIEND_AGREE_RESPOND);
     }

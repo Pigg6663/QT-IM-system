@@ -253,11 +253,24 @@ try {
         Test-Result "前置：B 收到好友请求转发" $false `
             "(type=$(if ($resendB) { $resendB.Type } else { 'none' }))"
     } else {
-        $agree = New-Pdu -Type $ADD_FRIEND_AGREE_REQUEST -Data1 $userB -Data2 $userA
+        # caData 语义与真实客户端一致：[发起方 A, 同意方 B]。
+        # 客户端收到 ADD_FRIEND_RESEND 后会原样沿用 caData（发起方 + 自己），
+        # 所以这里也必须把 A 放在前 32 字节，否则测的就不是真实流程。
+        $agree = New-Pdu -Type $ADD_FRIEND_AGREE_REQUEST -Data1 $userA -Data2 $userB
         $sessB.Client.GetStream().Write($agree, 0, $agree.Length)
         $rbAgree = Read-Pdu -Client $sessB.Client
         $friendReady = ($rbAgree.Type -eq $ADD_FRIEND_AGREE_RESPOND -and $rbAgree.ResultBool)
         Test-Result "前置：建立 A-B 好友关系" $friendReady "(result=$($rbAgree.ResultBool))"
+
+        # 同意成功后，服务端还会给发起方 A 回一条 ADD_FRIEND_AGREE_RESPOND 通知。
+        # 必须显式消费掉：它是真实行为（A 需要知道自己被同意了），但若留在 A 的
+        # 接收缓冲区里，后面每个用例都会读到上一个用例的包，导致断言错位。
+        $notifyA = Try-Read-Pdu -Client $sessA.Client -TimeoutMs 2000
+        if ($null -ne $notifyA -and $notifyA.Type -eq $ADD_FRIEND_AGREE_RESPOND) {
+            Write-Host "    (已消费发起方 A 的同意通知 type=$($notifyA.Type))" -ForegroundColor DarkGray
+        } else {
+            Write-Host "    (未收到发起方通知，type=$(if ($notifyA) { $notifyA.Type } else { 'none' }))" -ForegroundColor DarkYellow
+        }
     }
 
     # 清掉残留（A 会收到一条 ADD_FRIEND_AGREE_RESPOND 通知）

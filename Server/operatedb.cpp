@@ -47,7 +47,9 @@ QString operateDB::makeSalt()
     QByteArray raw(16, 0);
     for (int i = 0; i < 16; ++i)
     {
-        raw[i] = char(QRandomGenerator::global()->bounded(256));
+        // 用 QRandomGenerator::system()：由操作系统 CSPRNG 提供的密码学安全随机源。
+        // 不要用 global()——它是可预测的伪随机数生成器，不适合生成盐。
+        raw[i] = char(QRandomGenerator::system()->bounded(256));
     }
     return QString::fromLatin1(raw.toHex());      // 32 位 hex
 }

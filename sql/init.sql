@@ -32,8 +32,10 @@ CREATE TABLE IF NOT EXISTS `user_info` (
 -- 好友关系表（无向关系：A-B 与 B-A 语义相同）
 -- 查询好友列表时对 user_id / friend_id 做双向 union 匹配
 --
--- uk_friend_pair 唯一约束的作用：双方同时互加好友时，
--- 只会落一行关系，不会产生重复记录
+-- uk_friend_pair 唯一约束的作用：阻止同一方向（user_id -> friend_id）
+-- 重复插入，例如同一申请被重复同意时不会落两行。
+-- 注意它不能阻止 A->B 与 B->A 同时存在——这是两个不同的有序元组；
+-- 只是好友列表查询做了双向 union，所以结果里看不出重复。
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `friend` (
     `id`        INT NOT NULL AUTO_INCREMENT,
