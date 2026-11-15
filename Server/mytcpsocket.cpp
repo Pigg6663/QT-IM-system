@@ -21,6 +21,7 @@ MyTcpSocket::~MyTcpSocket()
 // 收包状态机：处理半包(缓存等待)、粘包(循环切分)、非法长度(断开)
 void MyTcpSocket::recvMsg()
 {
+    m_lastActiveMs = QDateTime::currentMSecsSinceEpoch();
     m_recvBuf.append(this->readAll());
 
     while (true)
@@ -104,7 +105,20 @@ PDU *MyTcpSocket::handleMsg(PDU *pdu)
     case ENUM_TYPE_LOGIN_REQUEST:
     {
       respdu=m_pmh->login(m_strLoginName);
+      // 登录成功则踢掉该账号的其它在线连接（except=this，避免把自己踢掉）
+      bool ok = (respdu != NULL) && (*(bool*)respdu->caData);
+      if (ok)
+      {
+          MyTcpServer::getInstance().kickDuplicate(m_strLoginName, this);
+      }
       break;
+    }
+    case ENUM_TYPE_HEARTBEAT_REQUEST:
+    {
+        // 心跳只回包，不查库
+        respdu = mkPDU();
+        respdu->uiType = ENUM_TYPE_HEARTBEAT_RESPOND;
+        break;
     }
     case ENUM_TYPE_FIND_USER_REQUEST:
     {

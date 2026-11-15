@@ -6,6 +6,7 @@
 
 #include <QByteArray>
 #include <QTcpSocket>
+#include <QTimer>
 #include <QWidget>
 
 QT_BEGIN_NAMESPACE
@@ -32,6 +33,7 @@ public:
 public slots:
      void showConnect();
      void recvMsg();
+     void onSocketDisconnected();
 
 private slots:
     // void on_sendPB_clicked();
@@ -43,6 +45,7 @@ private slots:
 private:
     Ui::Client *ui;
     QByteArray m_recvBuf;        // 接收缓冲区：处理半包与粘包
+    QTimer m_heartbeatTimer;     // 心跳定时器
     Client(QWidget*parent=nullptr);
     Client(const Client& instance)=delete;
     Client& operator=(const Client&)=delete;

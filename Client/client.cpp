@@ -9,6 +9,10 @@
 #include <QMessageBox>
 #include <cstring>
 
+namespace {
+const int kHeartbeatIntervalMs = 15000;   // 15 秒发一次心跳，小于服务端 35 秒超时
+}
+
 Client::Client(QWidget *parent)
     : QWidget(parent)
     , ui(new Ui::Client)
@@ -20,6 +24,15 @@ Client::Client(QWidget *parent)
 
     connect(&m_socket,&QTcpSocket::connected,this,&Client::showConnect);
     connect(&m_socket,&QTcpSocket::readyRead,this,&Client::recvMsg);
+    connect(&m_socket,&QTcpSocket::disconnected,this,&Client::onSocketDisconnected);
+
+    // 心跳：定时发 HEARTBEAT_REQUEST，让服务端知道本连接仍然存活
+    m_heartbeatTimer.setInterval(kHeartbeatIntervalMs);
+    connect(&m_heartbeatTimer, &QTimer::timeout, this, [this]() {
+        PDU* pdu = mkPDU();
+        pdu->uiType = ENUM_TYPE_HEARTBEAT_REQUEST;
+        sendMsg(pdu);          // sendMsg 内部负责 write + free
+    });
 
     m_prh = new ResHandler();
 }
@@ -74,6 +87,14 @@ void Client::loadConfig()
 void Client::showConnect()
 {
     qDebug()<<"链接成功";
+    m_heartbeatTimer.start();
+}
+
+void Client::onSocketDisconnected()
+{
+    m_heartbeatTimer.stop();
+    m_recvBuf.clear();
+    qDebug()<<"与服务端断开连接";
 }
 
 // 收包状态机：处理半包(缓存等待)、粘包(循环切分)、非法长度(断开)
@@ -132,6 +153,20 @@ void Client::handleMsg(PDU *pdu)
     m_prh->pdu=pdu;
     switch(pdu->uiType)
     {
+    case ENUM_TYPE_HEARTBEAT_RESPOND:
+    {
+        // 心跳应答，无需处理
+        break;
+    }
+    case ENUM_TYPE_KICKED_RESEND:
+    {
+        // 账号在别处登录，被服务端踢下线
+        m_heartbeatTimer.stop();
+        QMessageBox::warning(&Client::getInstance(), "下线通知",
+                             "您的账号已在其他地方登录，当前连接已断开");
+        m_socket.disconnectFromHost();
+        break;
+    }
     case ENUM_TYPE_REGIST_RESPOND:
     {
         m_prh->regist();
