@@ -18,6 +18,8 @@ ALTER TABLE `user_info`
     MODIFY `pwd` VARCHAR(64) NOT NULL;
 
 -- 3) 好友关系去重（保留每组关系里 id 最小的一行）
+ALTER TABLE `friend`
+    ADD COLUMN `id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST;
 DELETE f1 FROM `friend` f1
     INNER JOIN `friend` f2
     WHERE f1.`user_id` = f2.`user_id`
