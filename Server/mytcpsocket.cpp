@@ -95,6 +95,8 @@ PDU *MyTcpSocket::handleMsg(PDU *pdu)
             <<"pdu->caMsg"<<pdu->caMsg;
     PDU* respdu=NULL;
     m_pmh->pdu=pdu;
+    // 每次分发前把当前登录名同步给业务层，供网盘路径越权校验使用
+    m_pmh->m_loginName = m_strLoginName;
     switch(pdu->uiType)
     {
     case ENUM_TYPE_REGIST_REQUEST:

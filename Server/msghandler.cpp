@@ -9,9 +9,82 @@
 #include <QFile>
 #include <QFileInfo>
 #include<QStringList>
+
+namespace {
+// 当前用户网盘的绝对路径根：<m_strRootPath>/<登录名>
+QString userRootAbs(const QString& loginName)
+{
+    const QString root = Server::getInstance().m_strRootPath + "/" + loginName;
+    return QDir(root).absolutePath();
+}
+
+// 浅拷贝一份完整的 PDU。
+// 用于"既要把包转发给别人、又要保证原 pdu 生命周期不被提前结束"的场景：
+// handleMsg() 在分派结束后会 free(pdu)，如果不复制就转发，
+// 接收方拿到的是已释放内存（use-after-free）。
+PDU* clonePdu(const PDU* src)
+{
+    if (src == NULL)
+    {
+        return NULL;
+    }
+    PDU* dst = mkPDU(src->uiMsgLen);
+    memcpy(dst, src, src->uiTotalLen);
+    return dst;
+}
+}
+
 MsgHandler::MsgHandler()
 {
 
+}
+
+// ---------------------------------------------------------------
+// 路径安全：客户端传来的路径必须严格落在当前用户的网盘根目录内
+// ---------------------------------------------------------------
+bool MsgHandler::isSafePath(const QString& strPath) const
+{
+    if (m_loginName.isEmpty() || strPath.isEmpty())
+    {
+        return false;
+    }
+    // 拒绝含空字节的路径（可能截断底层 API 的字符串）
+    if (strPath.contains(QChar('\0')))
+    {
+        return false;
+    }
+
+    const QString rootAbs = QDir::cleanPath(userRootAbs(m_loginName));
+    // QDir::absolutePath() 内部会做 cleanPath，".." 在此被解析消掉
+    const QString abs     = QDir::cleanPath(QDir(strPath).absolutePath());
+
+    // 必须等于根目录，或位于根目录下。
+    // 注意带上分隔符再比较，否则 /userdata/alice2 会被误判为在 /userdata/alice 之内。
+    return abs == rootAbs || abs.startsWith(rootAbs + "/");
+}
+
+bool MsgHandler::isSafePathOrRespond(const QString& strPath,
+                                     ENUM_TYPE respondType,
+                                     PDU** outRespond) const
+{
+    if (isSafePath(strPath))
+    {
+        return true;
+    }
+    qWarning() << "拒绝越权路径访问:" << strPath << " 登录名:" << m_loginName;
+    if (outRespond != NULL)
+    {
+        *outRespond = makeBoolRespond(respondType, false);
+    }
+    return false;
+}
+
+PDU* MsgHandler::makeBoolRespond(ENUM_TYPE type, bool ret) const
+{
+    PDU* respdu = mkPDU();
+    respdu->uiType = type;
+    memcpy(respdu->caData, &ret, sizeof(bool));
+    return respdu;
 }
 
 PDU *MsgHandler::regist()
@@ -20,7 +93,7 @@ PDU *MsgHandler::regist()
     memcpy(caName,pdu->caData,32);
     char caPWD[32]={'\0'};
     memcpy(caPWD,pdu->caData+32,32);
-    qDebug()<<"regist caName"<<caName<<"caPWD"<<caPWD;
+    qDebug()<<"regist caName"<<caName;
     bool ret =operateDB::getInstance().handleRegist(caName,caPWD);
     qDebug()<<"regist ret"<<ret;
     if (ret) {
@@ -65,7 +138,7 @@ PDU *MsgHandler::login(QString& strLoginName)
     memcpy(caName,pdu->caData,32);
     char caPwd[32]={'\0'};
     memcpy(caPwd,pdu->caData+32,32);
-    qDebug()<<"login caName"<<caName<<"caPwd"<<caPwd;
+    qDebug()<<"login caName"<<caName;
     bool ret =operateDB::getInstance().handleLogin(caName,caPwd);
     qDebug()<<"login ret"<<ret;
     if(ret)
@@ -88,8 +161,11 @@ PDU *MsgHandler::addFriend()
     int ret =operateDB::getInstance().handleAddFriend(caCurName,caTarName);
     if(ret==1)
     {
-        pdu->uiType =ENUM_TYPE_ADD_FRIEND_RESEND;
-        MyTcpServer::getInstance().resend(caTarName,pdu);
+        // 转发给对方的是一份独立拷贝：原 pdu 随后会被 handleMsg 释放
+        PDU* resendPdu = clonePdu(pdu);
+        resendPdu->uiType = ENUM_TYPE_ADD_FRIEND_RESEND;
+        MyTcpServer::getInstance().resend(caTarName,resendPdu);
+        free(resendPdu);
         return NULL;
     }
     PDU* respdu=mkPDU();
@@ -111,7 +187,10 @@ PDU *MsgHandler::addFriendAgree()
 
     respdu->uiType=ENUM_TYPE_ADD_FRIEND_AGREE_RESPOND;
     memcpy(respdu->caData,&ret,sizeof(bool));
-    MyTcpServer::getInstance().resend(caCurName,respdu);
+    // 通知请求发起方：用独立拷贝，respdu 本身还要返回给当前连接并会被释放
+    PDU* notifyPdu = clonePdu(respdu);
+    MyTcpServer::getInstance().resend(caCurName,notifyPdu);
+    free(notifyPdu);
     return respdu;
 }
 
@@ -148,50 +227,74 @@ PDU *MsgHandler::chat()
 {
     char tarName[32] = {'\0'};
     memcpy(tarName, pdu->caData+32, 32);
-    pdu->uiType = ENUM_TYPE_CHAT_RESEND;
-    MyTcpServer::getInstance().resend(tarName, pdu);
+    // 转发独立拷贝，避免原 pdu 被 handleMsg 释放后接收方读到已释放内存
+    PDU* resendPdu = clonePdu(pdu);
+    resendPdu->uiType = ENUM_TYPE_CHAT_RESEND;
+    MyTcpServer::getInstance().resend(tarName, resendPdu);
+    free(resendPdu);
     return NULL;
 }
 
 PDU *MsgHandler::mkdir()
 {
-    QString strPath = QString("%1/%2").arg(pdu->caMsg).arg(pdu->caData);
-       qDebug() << "mkdir strPath" << strPath;
-       QDir dir;
-       bool ret = dir.mkpath(strPath);
-       qDebug() << "mkdir ret: " << ret;
-       PDU* respdu = mkPDU();
-       respdu->uiType = ENUM_TYPE_MKDIR_RESPOND;
-       memcpy(respdu->caData, &ret, sizeof(bool));
-       return respdu;
+    // caMsg 是当前目录，caData 是新建的文件夹名
+    const QString strPath = QString("%1/%2").arg(QString(pdu->caMsg)).arg(pdu->caData);
+    qDebug() << "mkdir strPath" << strPath;
+
+    PDU* errRespond = NULL;
+    if (!isSafePathOrRespond(strPath, ENUM_TYPE_MKDIR_RESPOND, &errRespond))
+    {
+        return errRespond;
+    }
+
+    QDir dir;
+    bool ret = dir.mkpath(strPath);
+    qDebug() << "mkdir ret: " << ret;
+    return makeBoolRespond(ENUM_TYPE_MKDIR_RESPOND, ret);
 }
 
 
 PDU *MsgHandler::flushFile()
 {
-    QDir dir(pdu->caMsg);
-        QFileInfoList fileInfoList = dir.entryInfoList();
+    // 目录列表同样要校验，否则可以枚举服务器任意目录
+    const QString strPath = QString(pdu->caMsg);
+    qDebug() << "flushFile strPath" << strPath;
 
-        PDU* respdu = mkPDU(fileInfoList.size() * sizeof(FileInfo));
-        respdu->uiType = ENUM_TYPE_FLUSH_FILE_RESPOND;
-        for (int i=0; i<fileInfoList.size(); i++) {
-            FileInfo* pFileInfo = (FileInfo*)respdu->caMsg+i;
-            if (fileInfoList[i].isDir()) {
-                pFileInfo->iFileType = 0;
-            } else {
-                pFileInfo->iFileType = 1;
-            }
-            memcpy(pFileInfo->caName,
-            fileInfoList[i].fileName().toStdString().c_str(), 32);
-            qDebug() << "pFileInfo->caName" << pFileInfo->caName;
+    PDU* errRespond = NULL;
+    if (!isSafePathOrRespond(strPath, ENUM_TYPE_FLUSH_FILE_RESPOND, &errRespond))
+    {
+        return errRespond;
+    }
+
+    QDir dir(strPath);
+    QFileInfoList fileInfoList = dir.entryInfoList();
+
+    PDU* respdu = mkPDU(fileInfoList.size() * sizeof(FileInfo));
+    respdu->uiType = ENUM_TYPE_FLUSH_FILE_RESPOND;
+    for (int i=0; i<fileInfoList.size(); i++) {
+        FileInfo* pFileInfo = (FileInfo*)respdu->caMsg+i;
+        if (fileInfoList[i].isDir()) {
+            pFileInfo->iFileType = 0;
+        } else {
+            pFileInfo->iFileType = 1;
         }
-        return respdu;
+        memcpy(pFileInfo->caName,
+        fileInfoList[i].fileName().toStdString().c_str(), 32);
+    }
+    return respdu;
 }
 
 PDU *MsgHandler::delDir()
 {
-    QString strPath = QString("%1/%2").arg(pdu->caMsg).arg(pdu->caData);
+    const QString strPath = QString("%1/%2").arg(QString(pdu->caMsg)).arg(pdu->caData);
     qDebug() << "delDir strPath" << strPath;
+
+    PDU* errRespond = NULL;
+    if (!isSafePathOrRespond(strPath, ENUM_TYPE_DEL_DIR_RESPOND, &errRespond))
+    {
+        return errRespond;
+    }
+
     QFileInfo fileInfo(strPath);
     bool ret = false;
     if (fileInfo.isDir()) {
@@ -202,10 +305,7 @@ PDU *MsgHandler::delDir()
         ret = file.remove();
     }
     qDebug() << "delDir ret:" << ret;
-    PDU* respdu = mkPDU();
-    respdu->uiType = ENUM_TYPE_DEL_DIR_RESPOND;
-    memcpy(respdu->caData, &ret, sizeof(bool));
-    return respdu;
+    return makeBoolRespond(ENUM_TYPE_DEL_DIR_RESPOND, ret);
 }
 
 PDU *MsgHandler::renameFile()
@@ -218,13 +318,19 @@ PDU *MsgHandler::renameFile()
     QString strOldPath = QString("%1/%2").arg(strCurPath).arg(caOldName);
     QString strNewPath = QString("%1/%2").arg(strCurPath).arg(caNewName);
     qDebug() << "renameFile from" << strOldPath << "to" << strNewPath;
+
+    PDU* errRespond = NULL;
+    // 源和目标都要校验，防止借重命名把文件写到根目录之外
+    if (!isSafePathOrRespond(strOldPath, ENUM_TYPE_RENAME_FILE_RESPOND, &errRespond)
+        || !isSafePathOrRespond(strNewPath, ENUM_TYPE_RENAME_FILE_RESPOND, &errRespond))
+    {
+        return errRespond;
+    }
+
     QDir dir;
     bool ret = dir.rename(strOldPath, strNewPath);
     qDebug() << "renameFile ret:" << ret;
-    PDU* respdu = mkPDU();
-    respdu->uiType = ENUM_TYPE_RENAME_FILE_RESPOND;
-    memcpy(respdu->caData, &ret, sizeof(bool));
-    return respdu;
+    return makeBoolRespond(ENUM_TYPE_RENAME_FILE_RESPOND, ret);
 }
 
 PDU *MsgHandler::moveFile()
@@ -233,7 +339,6 @@ PDU *MsgHandler::moveFile()
     char caTargetDir[32] = {'\0'};
     memcpy(caFileName, pdu->caData, 32);
     memcpy(caTargetDir, pdu->caData+32, 32);
-    QString strCurPath(pdu->caMsg);
     QStringList paths = QString(pdu->caMsg).split('\n');
     QString strSrcPath;
     QString strDstPath;
@@ -241,26 +346,42 @@ PDU *MsgHandler::moveFile()
         strSrcPath = paths[0] + "/" + caFileName;
         strDstPath = paths[1] + "/" + caFileName;
     } else {
-        strSrcPath = strCurPath + "/" + caFileName;
+        strSrcPath = QString(pdu->caMsg) + "/" + caFileName;
         strDstPath = QString(caTargetDir) + "/" + caFileName;
     }
     qDebug() << "moveFile from" << strSrcPath << "to" << strDstPath;
+
+    PDU* errRespond = NULL;
+    // 源与目标都必须落在用户根目录内
+    if (!isSafePathOrRespond(strSrcPath, ENUM_TYPE_MOVE_FILE_RESPOND, &errRespond)
+        || !isSafePathOrRespond(strDstPath, ENUM_TYPE_MOVE_FILE_RESPOND, &errRespond))
+    {
+        return errRespond;
+    }
+
     QDir dir;
     bool ret = dir.rename(strSrcPath, strDstPath);
     qDebug() << "moveFile ret:" << ret;
-    PDU* respdu = mkPDU();
-    respdu->uiType = ENUM_TYPE_MOVE_FILE_RESPOND;
-    memcpy(respdu->caData, &ret, sizeof(bool));
-    return respdu;
+    return makeBoolRespond(ENUM_TYPE_MOVE_FILE_RESPOND, ret);
 }
 
 PDU *MsgHandler::uploadFile()
 {
     char caFileName[32] = {'\0'};
     memcpy(caFileName, pdu->caData, 32);
-    qint64 fileSize = QString(pdu->caData+32).toLongLong();
-    QString strPath = QString("%1/%2").arg(pdu->caMsg).arg(caFileName);
-    qDebug() << "uploadFile path:" << strPath << "size:" << fileSize;
+    // caMsg = "目标目录路径 + '\0' + 文件二进制数据"
+    const QString strDir  = QString::fromUtf8(pdu->caMsg);
+    const QString strPath = QString("%1/%2").arg(strDir).arg(caFileName);
+    qDebug() << "uploadFile path:" << strPath;
+
+    PDU* errRespond = NULL;
+    // 只校验 '\0' 之前的路径部分，不能把文件体当路径
+    if (!isSafePathOrRespond(strDir, ENUM_TYPE_UPLOAD_FILE_RESPOND, &errRespond)
+        || !isSafePathOrRespond(strPath, ENUM_TYPE_UPLOAD_FILE_RESPOND, &errRespond))
+    {
+        return errRespond;
+    }
+
     QFile file(strPath);
     bool ret = false;
     if (file.open(QIODevice::WriteOnly)) {
@@ -274,25 +395,30 @@ PDU *MsgHandler::uploadFile()
         ret = true;
     }
     qDebug() << "uploadFile ret:" << ret;
-    PDU* respdu = mkPDU();
-    respdu->uiType = ENUM_TYPE_UPLOAD_FILE_RESPOND;
-    memcpy(respdu->caData, &ret, sizeof(bool));
-    return respdu;
+    return makeBoolRespond(ENUM_TYPE_UPLOAD_FILE_RESPOND, ret);
 }
 
 PDU *MsgHandler::downloadFile()
 {
     char caFileName[32] = {'\0'};
     memcpy(caFileName, pdu->caData, 32);
-    QString strPath = QString("%1/%2").arg(pdu->caMsg).arg(caFileName);
+    const QString strDir  = QString(pdu->caMsg);
+    const QString strPath = QString("%1/%2").arg(strDir).arg(caFileName);
     qDebug() << "downloadFile path:" << strPath;
+
+    PDU* errRespond = NULL;
+    if (!isSafePathOrRespond(strDir, ENUM_TYPE_DOWNLOAD_FILE_RESPOND, &errRespond)
+        || !isSafePathOrRespond(strPath, ENUM_TYPE_DOWNLOAD_FILE_RESPOND, &errRespond))
+    {
+        return errRespond;
+    }
+
     QFile file(strPath);
     PDU* respdu = nullptr;
     if (file.open(QIODevice::ReadOnly)) {
         QByteArray fileData = file.readAll();
         file.close();
-        QString strInfo = QString("%1").arg(pdu->caMsg);
-        QByteArray infoBytes = strInfo.toUtf8();
+        QByteArray infoBytes = strDir.toUtf8();
         int totalMsgLen = infoBytes.size() + 1 + fileData.size();
         respdu = mkPDU(totalMsgLen);
         respdu->uiType = ENUM_TYPE_DOWNLOAD_FILE_RESPOND;
@@ -314,8 +440,18 @@ PDU *MsgHandler::shareFile()
     char caTarName[32] = {'\0'};
     memcpy(caFileName, pdu->caData, 32);
     memcpy(caTarName, pdu->caData+32, 32);
-    QString strFilePath = QString("%1/%2").arg(pdu->caMsg).arg(caFileName);
+    const QString strDir  = QString(pdu->caMsg);
+    const QString strFilePath = QString("%1/%2").arg(strDir).arg(caFileName);
     qDebug() << "shareFile path:" << strFilePath << "to user:" << caTarName;
+
+    PDU* errRespond = NULL;
+    // 只允许分享自己网盘目录内的文件
+    if (!isSafePathOrRespond(strDir, ENUM_TYPE_SHARE_FILE_RESPOND, &errRespond)
+        || !isSafePathOrRespond(strFilePath, ENUM_TYPE_SHARE_FILE_RESPOND, &errRespond))
+    {
+        return errRespond;
+    }
+
     QFile file(strFilePath);
     bool ret = false;
     if (file.open(QIODevice::ReadOnly)) {
@@ -329,10 +465,8 @@ PDU *MsgHandler::shareFile()
         memcpy(sharePdu->caMsg, pdu->caMsg, pathLen);
         memcpy(sharePdu->caMsg + pathLen, fileData.constData(), fileData.size());
         MyTcpServer::getInstance().resend(caTarName, sharePdu);
+        free(sharePdu);
         ret = true;
     }
-    PDU* respdu = mkPDU();
-    respdu->uiType = ENUM_TYPE_SHARE_FILE_RESPOND;
-    memcpy(respdu->caData, &ret, sizeof(bool));
-    return respdu;
+    return makeBoolRespond(ENUM_TYPE_SHARE_FILE_RESPOND, ret);
 }
