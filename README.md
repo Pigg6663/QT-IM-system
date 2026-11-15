@@ -7,7 +7,7 @@
 
 在基础功能之上完成了三项工程化深化：**健壮的收包状态机**（粘包 / 半包 / 非法长度）、
 **连接保活与重复登录互踢**（心跳 + 超时巡检）、**安全加固**（SQL 预处理、口令加盐哈希、网盘路径越权防护）。
-所有修复均配有可复现的自动化测试脚本，见 [`tests/`](tests)。
+所有修复均配有可复现的自动化测试脚本，见 [`tests/`](tests)；第八节列出完整的问题清单与修复状态。
 
 > 本项目为个人学习实践项目，完整覆盖了 网络编程、自定义协议设计、数据库设计、Qt 信号槽与单例模式 等后端 / 客户端核心知识点。
 
@@ -61,13 +61,11 @@
 │   ├── init.sql                # 建库建表（含 salt 列、好友唯一约束）
 │   └── migrate_v2.sql          # 旧库升级脚本（加盐哈希 + 唯一约束 + 去重）
 │
-├── tests/
-│   ├── build.ps1               # 一键构建两端，失败即中断
-│   ├── test_protocol.ps1       # 粘包 / 半包 / 非法包长
-│   ├── test_heartbeat.ps1      # 心跳 / 重复登录互踢 / 超时回收
-│   └── test_security.ps1       # SQL 注入 / 口令哈希 / 路径越权
-│
-└── 项目总结.md                  # 面试复习文档（架构 / 考点 / 改进方向）
+└── tests/
+    ├── build.ps1               # 一键构建两端，失败即中断
+    ├── test_protocol.ps1       # 粘包 / 半包 / 非法包长
+    ├── test_heartbeat.ps1      # 心跳 / 重复登录互踢 / 超时回收
+    └── test_security.ps1       # SQL 注入 / 口令哈希 / 路径越权
 ```
 
 ---
@@ -97,14 +95,15 @@
 设计要点：
 
 - **请求 - 响应模型**：客户端发送 `*_REQUEST`，服务端处理后回 `*_RESPOND`；服务端主动转发的消息使用 `*_RESEND` 类型。
-- **服务端不保存业务状态**：每个 `MyTcpSocket` 只记录一个 `m_strLoginName`，在线状态持久化在数据库 `online` 字段中。
-- **单线程事件循环**：服务端无独立界面，完全依靠 `QApplication` 事件循环驱动 `readyRead` 信号处理并发请求。
+- **服务端不保存业务状态**：每个 `MyTcpSocket` 只记录一个 `m_strLoginName` 与最后活跃时间，在线状态持久化在数据库 `online` 字段中。
+- **单线程事件循环**：服务端无独立界面，完全依靠 `QApplication` 事件循环驱动 `readyRead` 信号处理并发请求；
+  心跳巡检由同一事件循环上的 `QTimer` 驱动。
 
 ---
 
 ## 四、通信协议设计
 
-两端各自维护一份 `protocol.h` / `protocol.cpp`，定义必须严格一致。
+两端各自维护一份 `protocol.h` / `protocol.cpp`，定义必须**逐字节一致**（见 5.1）。
 
 ### 1. PDU 数据包结构
 
@@ -133,6 +132,14 @@ PDU* mkPDU(uint uiMsgLen) {
 }
 ```
 
+头部布局由编译期断言锁定，不再依赖"编译器恰好这么排"的隐含假设：
+
+```cpp
+constexpr unsigned int PDU_HEADER_LEN    = 76;
+constexpr unsigned int PDU_MAX_TOTAL_LEN = 8u * 1024u * 1024u;  // 单包上限 8MB
+static_assert(sizeof(PDU) == 76, "PDU header layout broken");
+```
+
 ### 2. 消息类型
 
 共 **18 组业务消息**（`REQUEST` / `RESPOND` 成对），另有 2 个服务端转发类型和 1 个强制下线通知：
@@ -148,12 +155,11 @@ PDU* mkPDU(uint uiMsgLen) {
 
 > ⚠️ **枚举只能追加在 `ENUM_TYPE_MAX` 之前（即末尾）**。协议靠数值传输，
 > 若把新类型插到中间，后面所有类型的数值都会整体后移，新旧客户端直接对不上。
-> 两份 `protocol.h` 的枚举顺序必须完全一致。
 
 ### 3. 拆包方式（解决 TCP 粘包 / 半包）
 
 包头记录总长度，接收端维护**接收缓冲区**，循环判断「头部长度 + 包体长度」是否收齐后再解析。
-完整实现见第八节 8.1，核心思路：
+完整实现见 8.1，核心思路：
 
 ```cpp
 m_recvBuf.append(this->readAll());                        // 累积字节流
@@ -188,13 +194,52 @@ while (true) {
 
 ---
 
-## 五、核心业务流程
+## 五、工程细节约定
+
+### 5.1 两份 `protocol.h` 必须同步
+
+`Server/protocol.h` 与 `Client/protocol.h` 是两份独立拷贝，协议靠**数值**传输，任何一处不一致都会导致两端解析错位。
+
+本项目采用的做法：
+
+- 修改时**只改一份**，然后直接覆盖另一份（`Copy-Item` / `cp`），保证逐字节相同；
+- 用 `static_assert(sizeof(PDU) == 76)` 在编译期锁定头部布局；
+- 提交前用哈希核对一致性：
+
+```powershell
+(Get-FileHash Server\protocol.h).Hash -eq (Get-FileHash Client\protocol.h).Hash
+# 或
+fc /n Server\protocol.h Client\protocol.h
+```
+
+> 更彻底的做法是抽出一份共享头文件，两个 `.pro` 都 `INCLUDEPATH += ../common`，
+> 把"靠人工保证"变成"靠构建保证"。本项目暂未做该重构，但这是明确的下一步。
+
+### 5.2 内存所有权
+
+项目里 `PDU` 是 `malloc/free`，`MyTcpSocket` 是 `new/deleteLater`。改动时守住三条：
+
+- `mkPDU()` 出来的必须 `free()`，**不能 `delete`**；
+- `handleMsg()` 与 `sendMsg()` 内部已各自释放一次，调用方不要重复释放；
+- 需要"同一个包既要转发又要自己释放"时，用 `clonePdu()` 复制独立 PDU（见 `msghandler.cpp`）。
+
+### 5.3 配置文件必须使用 CRLF 换行
+
+`Server/connect.config.txt` 与 `Client/connect.config.txt` 通过 `.qrc` 编译进可执行文件。
+两者都必须以 **CRLF** 结尾并保留末尾换行；读取侧已改为按行切分并 `trim()`，
+若文件为空或只有一行，端口会解析为 0 导致 `listen()` 失败（服务端会打印明确警告）。
+
+---
+
+## 六、核心业务流程
 
 **1. 注册**
-输入校验 → `REGIST_REQUEST` → 服务端查询是否重名 → `insert` → 成功后 `QDir::mkpath` 创建个人网盘目录 → 返回 `bool`。
+输入校验 → `REGIST_REQUEST` → 服务端查重（预处理查询）→ 生成随机盐 + SHA-256 哈希后 `insert`
+→ 成功后 `QDir::mkpath` 创建个人网盘目录 → 返回 `bool`。
 
 **2. 登录**
-`LOGIN_REQUEST` → 校验账号密码 → 数据库 `online = 1` → **将该登录名写入 socket 的 `m_strLoginName`** → 返回 `bool` → 客户端跳转主界面。
+`LOGIN_REQUEST` → 按用户名取出 `pwd`/`salt` → 重算哈希比对 → 数据库 `online = 1`
+→ **将该登录名写入 socket 的 `m_strLoginName`** → 踢掉同账号旧连接 → 返回 `bool` → 客户端跳转主界面。
 
 **3. 加好友（三步握手）**
 
@@ -204,17 +249,22 @@ while (true) {
 4. B 同意 → `ADD_FRIEND_AGREE_REQUEST` → 服务端写入 `friend` 表 → **双方都收到成功响应**
 
 **4. 聊天**
-A 发送 `CHAT_REQUEST`（caData：`A` | `B`，caMsg：消息内容）→ 服务端仅将类型改为 `CHAT_RESEND`，
+A 发送 `CHAT_REQUEST`（caData：`A` | `B`，caMsg：消息内容）→ 服务端复制一份 PDU 并将类型改为 `CHAT_RESEND`，
 按目标用户登录名在连接列表中查找 socket 并转发 → B 的聊天窗口显示。
 （对方离线时消息直接丢弃，暂无离线消息存储。）
 
 **5. 网盘操作**
-客户端只发送「操作意图」（当前路径 + 文件名等），服务端在 `./userdata/<用户名>/` 下通过 `QDir` / `QFile` 实际执行并返回 `bool`。
+客户端只发送「操作意图」（当前路径 + 文件名等），服务端先用 `isSafePath()` 校验路径落在用户根目录内，
+再通过 `QDir` / `QFile` 实际执行并返回 `bool`。
 上传时客户端将文件数据拼入 PDU 一次性发出；下载 / 分享时服务端读取文件拼入 PDU 下发。
+
+**6. 连接保活**
+客户端每 15s 发一次 `HEARTBEAT_REQUEST`，服务端只回包不查库；
+服务端每 5s 巡检所有已登录连接，超过 35s 无任何上行数据即主动断开，由 `disconnected` 链路把 `online` 置 0。
 
 ---
 
-## 六、数据库设计
+## 七、数据库设计
 
 ```sql
 CREATE TABLE user_info (
@@ -235,7 +285,6 @@ CREATE TABLE friend (
 
 - **在线状态**：登录置 `online = 1`，正常断线置 `0`，注册默认 `0`；
   进程被杀 / 断网这类收不到 `disconnected` 的情况，由心跳超时巡检兜底置 0。
-  在线用户列表即 `select name from user_info where online = 1`。
 - **好友关系无向**：查询时做双向匹配（`union`）：
 
 ```sql
@@ -248,20 +297,20 @@ WHERE id IN (
 ```
 
 - **好友唯一约束**：`uk_friend_pair` 保证双方同时互加好友时只落一行关系，不会产生重复记录。
-- **口令存储**：注册时生成随机盐，存 `SHA-256(口令 + 盐)`；登录时按用户名取出 `pwd`/`salt` 重新计算比对。
+- **口令存储**：注册时生成随机盐，存 `SHA-256(口令 + 盐)`；登录时重新计算比对。
   历史明文记录（`salt` 为空）首次登录成功后会自动升级为哈希。
 
 完整建库脚本见 [`sql/init.sql`](sql/init.sql)，旧库升级见 [`sql/migrate_v2.sql`](sql/migrate_v2.sql)。
 
 ---
 
-## 七、构建与运行
+## 八、构建与运行
 
 ### 1. 环境要求
 
 - Qt 5.12 及以上（需包含 **Network**、**Sql**、**Widgets** 模块）
 - MySQL 5.7+ / 8.0，且 Qt 具备 **QMYSQL** 驱动
-- 编译器：MSVC 2017+ 或 MinGW（本项目在 Windows + Qt Creator 下开发）
+- 编译器：MSVC 2017+ 或 MinGW（本项目在 Windows + Qt 5.14.2 + MinGW 7.3.0 下开发验证）
 
 ### 2. 初始化数据库
 
@@ -288,11 +337,6 @@ cd Client && qmake Client.pro && nmake
 **启动顺序**：先启动 Server（监听 `5000` 端口），再启动 Client。
 服务端会在工作目录下自动创建 `./userdata/` 作为所有用户网盘的根目录。
 
-> 网络地址配置位于 `Server/connect.config.txt` 与 `Client/connect.config.txt`（第一行 IP，第二行端口），
-> 两个文件均通过 `.qrc` 资源打包进可执行文件，修改后需重新构建。
-> ⚠️ 两个文件**必须使用 CRLF 换行**并保留结尾换行；服务端读取时会按行切分并 trim，
-> 若文件只是一个空行会导致端口解析为 0、`listen()` 失败。
-
 ### 4. 一键构建与测试（可选）
 
 仓库附带 PowerShell 脚本，便于快速验证（需先启动服务端）：
@@ -316,30 +360,38 @@ powershell -ExecutionPolicy Bypass -File tests\test_security.ps1
 
 ---
 
-## 八、问题与修复记录
+## 九、问题与修复记录
 
-项目最初是一份课程作业，作者系统梳理出 9 个缺陷，并分三个阶段做了针对性深化。
-下表是**真实状态**，未完成的条目仍在待办中。
+本节是开发完成后的自我 code review 记录：先系统梳理出全部问题，再分三个阶段逐项修复，
+**下表是真实状态**，未完成的条目仍在待办中。
+
+### 9.1 修复状态总览
 
 | # | 问题 | 状态 | 修复方式 |
 |---|---|---|---|
-| 1 | 拆包未处理半包 / 粘包，长度字段未校验可致 `uint` 下溢巨量 `malloc` | ✅ 已修复 | 接收缓冲区 + 长度区间校验 + 循环切分（`static_assert` 锁定 76 字节头） |
-| 2 | 无心跳，进程被杀 / 断网后服务端无法感知，`online` 永远停在 1 | ✅ 已修复 | 客户端 15s 心跳 + 服务端 5s 巡检 / 35s 超时断开 |
+| 1 | 拆包未处理半包 / 粘包；长度未校验可致 `uint` 下溢巨量 `malloc` | ✅ 已修复 | 接收缓冲区 + 长度区间校验 + 循环切分；`static_assert` 锁定 76 字节头 |
+| 2 | 无心跳保活，进程被杀 / 断网后 `online` 无法回收 | ✅ 已修复 | 客户端 15s 心跳 + 服务端 5s 巡检 / 35s 超时断开 |
 | 3 | 重复登录无处理，同账号可多连接并存 | ✅ 已修复 | 登录成功后下发 `KICKED_RESEND` 并断开同名旧连接 |
-| 4 | SQL 全部用 `QString::arg()` 拼接，存在注入风险 | ✅ 已修复 | 全量改 `QSqlQuery::prepare()` + `bindValue()` 预处理绑定 |
-| 5 | 口令明文存储 | ✅ 已修复 | SHA-256 + 每用户 16 字节随机盐；历史明文记录登录时自动升级 |
-| 6 | 网盘文件操作直接使用客户端路径，可越权访问目录外文件 | ✅ 已修复 | `QDir::cleanPath` 规范化 + 用户根目录前缀断言（带分隔符比较） |
-| 7 | 消息转发用裸指针比较，聊天 / 加好友 / 分享文件全部无法命中 | ✅ 已修复 | 改为按字符串内容比较（`QByteArray` 比对，兼容 UTF-8 登录名） |
-| 8 | 转发时与 `handleMsg` 共用同一 `PDU`，存在 use-after-free / double free | ✅ 已修复 | 转发前 `clonePdu()` 出独立拷贝，各自负责释放 |
-| 9 | 大文件整包 `readAll()` 读入内存 | ⏳ 待办 | 计划改分片传输（固定分片 + 序号）+ 校验和 + 断点续传 |
-| 10 | 无离线消息，对方离线即丢弃 | ⏳ 待办 | 计划消息落库 + 登录后推送 |
-| 11 | 服务端单线程，连接量大时响应变慢 | ⏳ 待办 | 受 `QSqlDatabase` 不能跨线程共享连接限制，需先做连接管理重构 |
-| 12 | 聊天窗口全局复用，与多人聊天会串台 | ⏳ 待办 | 计划按会话维度维护窗口表 |
+| 4 | 服务端完全信任客户端传入的路径（路径穿越） | ✅ 已修复 | 由会话登录名拼出根目录，`QDir::cleanPath` 后做带分隔符的前缀断言 |
+| 5 | 口令明文存储 | ✅ 已修复 | 每用户 16 字节随机盐 + SHA-256；历史明文登录时惰性升级 |
+| 6 | SQL 全部为字符串拼接（注入风险） | ✅ 已修复 | 全量改 `QSqlQuery::prepare()` + `bindValue()`（12 处 prepare / 19 处 bind） |
+| 7 | 大文件整包读入内存 | ⏳ 待办 | 计划改分片传输（固定分片 + 序号）+ 校验和 + 断点续传 |
+| 8 | 无离线消息，对方离线即丢弃 | ⏳ 待办 | 计划消息落库 + 登录后推送 |
+| 9 | 服务端单线程处理，慢操作阻塞全部连接 | ⏳ 待办 | 连接层留在主线程（`QTcpSocket` 有线程亲和性），业务投递线程池；`QSqlDatabase` 需每线程独立连接 |
+| 10 | 聊天窗口全局复用，跨会话串消息、可能回复错人 | ⏳ 待办 | 计划按好友维度维护 `QMap<QString, Chat*>` |
 
-> 说明：第 11 项没有直接上线程池，是因为 Qt 的 `QSqlDatabase` 连接绑定创建它的线程，
-> 盲目改多线程会引入连接竞争。正确做法是"每线程独立连接 + 连接池"，这本身就是可以展开讲的取舍。
+关于第 9 项：Qt 的 `QSqlDatabase` 连接与创建它的线程绑定，不能跨线程共享。
+所以"直接加线程池"是错的，正确顺序是先做连接管理（每线程独立连接 / 连接池），再线程化业务——这个取舍本身值得展开讲。
 
-### 8.1 收包状态机（阶段 1 的核心）
+### 9.2 健壮性：收包状态机（第 1 项）
+
+原始实现假定一次 `readyRead` 恰好到达一个完整 PDU，有三个缺陷：
+
+- 未校验 `read()` 返回值，短读时剩余字节滞留缓冲并与下一个包的残体错位；
+- 一次 `readyRead` 内到达多个 PDU 时只解析第一个，其余被忽略；
+- `uiMsgLen = uiPDULen - sizeof(PDU)` 为 `uint` 运算，`uiPDULen < 76` 时下溢成极大值并直接传给 `malloc`。
+
+修复后的 `MyTcpSocket::recvMsg()`：
 
 ```cpp
 void MyTcpSocket::recvMsg()
@@ -373,32 +425,78 @@ void MyTcpSocket::recvMsg()
 }
 ```
 
-半包要缓存等待、粘包要循环切分、非法长度要断开，三者在同一个循环里处理，
-避免"读一次当一个包"造成的解析错位。
+客户端 `Client::recvMsg()` 用同样的状态机。`m_recvBuf.remove(0, n)` 每次是 O(n) 拷贝，
+数据量小可接受；要优化可改成"记录读偏移 + 攒够再统一 erase"，但先正确、再优化。
 
-### 8.2 测试脚本与验证方式
+### 9.3 连接保活与互踢（第 2、3 项）
 
-`tests/` 目录下的脚本**手工构造 PDU 字节流**，不依赖 GUI，可以直接复现上述修复：
+- 客户端 15s 心跳（小于服务端 35s 阈值，留出抖动余量）；
+- 服务端 `QTimer` 每 5s 巡检，只对**已登录**且未在断开流程中的连接做超时判定；
+- 遍历连接列表时用**副本 + `QPointer`**：`disconnectFromHost()` 可能同步触发
+  `disconnected → clineOffliine → removeSocket` 修改原列表，直接遍历会迭代器失效；
+- 登录成功后 `kickDuplicate(登录名, this)`：先下发 `KICKED_RESEND` 再断开旧连接，
+  传 `this` 是为了避免把自己踢掉。顺序必须是**先**让 `login()` 写好 `m_strLoginName`，**再**踢人。
+
+### 9.4 安全加固（第 4、5、6 项）
+
+- **SQL**：全部改为预处理绑定；`const char*` 参数统一走 `QString::fromUtf8`
+  （客户端用 `toStdString()` 发送，是 UTF-8，用 `fromLocal8Bit` 会让中文用户名乱码）。
+- **口令**：`salt = 16 字节 QRandomGenerator 随机数`，存 `SHA-256(口令 + salt)` 的 64 位 hex；
+  登录时按 `name` 取出 `pwd`/`salt` 重算比对；`salt` 为空视为历史明文记录，比对成功后自动升级。
+- **路径**：根目录由"服务端会话中记录的登录名"拼出，而不是信任客户端；
+  客户端路径先 `QDir::cleanPath()` 消解 `..`，再断言 `abs == root || abs.startsWith(root + "/")`。
+  带分隔符比较是必需的，否则 `/userdata/alice2` 会被误判为在 `/userdata/alice` 之内。
+  已覆盖 8 处文件操作（`mkdir` / `flushFile` / `delDir` / `renameFile` / `moveFile` / `uploadFile` / `downloadFile` / `shareFile`），
+  其中 `renameFile` 与 `moveFile` 对**源和目标**都校验。
+  `uploadFile` 的 `caMsg` 是"路径 + `\0` + 文件体"，只校验 `strlen` 之前的路径部分。
+
+### 9.5 关于 `resend()` 的比较写法（已澄清，非缺陷）
+
+原始代码里有一处 `caTarName == m_strLoginName`（`char*` 在左、`QString` 在右）。
+这里记录一次**自我更正**：
+
+- 该表达式**结果正确**。`const char*` 会通过 `QString(const char*)` 隐式构造（Qt5 中按 UTF-8 解码），
+  随后调用 `QString` 的成员 `operator==`，做的是**字符串内容比较**，不是指针比较；
+- 我用 `Qt5Core.dll` 实测确认：同名返回 `true`，异名返回 `false`，与 `strcmp` 结果一致；
+- 尽管如此，这种写法依赖隐式转换与"`caData` 已按 0 填充"的前提（由 `mkPDU()` 的 `memset` 保证），
+  且 Qt 5.15 已弃用该 ASCII 隐式转换重载。因此代码中改成了**显式内容比较**：
+
+```cpp
+const QByteArray tarName(caTarName);          // 按字节保留客户端发来的 UTF-8
+if (sock->m_strLoginName.toUtf8() == tarName) // 显式内容比较，无隐式转换歧义
+```
+
+同理，`chat()` / `addFriend()` / `addFriendAgree()` 转发时改为 `clonePdu()` 出独立副本。
+需要说明的是：**原写法在当前 Qt 版本下并不构成 use-after-free**——`QTcpSocket::write()`
+会把数据拷贝进内部写缓冲区，转发后立即释放原始 `PDU` 也不会读到悬空内存。
+改成显式副本是为了让所有权契约清楚、避免后续改造（例如写缓冲改为零拷贝）时踩坑，
+属于**可读性 / 可维护性改进**，不是修复线上缺陷。
+
+> 这两条值得单独记下来：code review 里"看起来可疑"和"确实是 bug"要分开，
+> 后者需要能复现的验证，前者应该写成"建议"而不是断言缺陷。
+
+### 9.6 测试脚本与验证方式
+
+`tests/` 下的脚本**手工构造 PDU 字节流**，不依赖 GUI，可直接复现上述修复：
 
 | 脚本 | 覆盖内容 | 结果 |
 |---|---|---|
 | `tests/build.ps1` | 构建两端，失败即中断 | — |
 | `tests/test_protocol.ps1` | 粘包（两包一次写）、半包（40+36 分两次写）、非法包长（10 字节）、超大包长（100MB）、异常后服务存活 | 6 / 6 通过 |
 | `tests/test_heartbeat.ps1` | 心跳应答、重复登录互踢、异常掉线 35s 超时回收 | 8 / 8 通过 |
-| `tests/test_security.ps1` | SQL 注入、口令哈希、错误口令、路径越权（列目录 / mkdir）、合法路径回归、历史明文升级 | 14 / 14 通过 |
+| `tests/test_security.ps1` | SQL 注入被拒、口令哈希格式、错误口令、路径越权（列目录 / mkdir，并验证未落盘）、合法路径回归、历史明文自动升级 | 14 / 14 通过 |
 
-运行方式（先启动服务端，再执行脚本）：
+### 9.7 已知取舍（暂不处理）
 
-```powershell
-powershell -ExecutionPolicy Bypass -File tests\build.ps1
-powershell -ExecutionPolicy Bypass -File tests\test_protocol.ps1
-powershell -ExecutionPolicy Bypass -File tests\test_heartbeat.ps1
-powershell -ExecutionPolicy Bypass -File tests\test_security.ps1
-```
+- 未引入单元测试框架，验证方式为协议级脚本 + 双客户端手动联调；
+- 服务端无界面，运行日志依赖 `qDebug()` 输出；
+- 服务端与客户端地址通过 `.qrc` 编译进可执行文件，修改需重新构建；
+- 好友关系以无向表存储，查询时需 `union` 双向匹配；数据量大时可冗余存储双向关系换取查询性能；
+- 未做 TLS，协议为明文传输，仅适用于内网 / 本机演示场景。
 
 ---
 
-## 九、可考察的知识点
+## 十、可考察的知识点
 
 | 知识点 | 项目对应实现 |
 |---|---|
@@ -408,18 +506,17 @@ powershell -ExecutionPolicy Bypass -File tests\test_security.ps1
 | 单例模式 | `Client` / `Index` / `File` / `Server` / `MyTcpServer` / `operateDB` 均为单例：Meyers 局部静态变量（C++11 线程安全）+ `delete` 拷贝构造与赋值 |
 | 信号槽机制 | `readyRead → recvMsg` 异步收发、`disconnected → clineOffliine` 断线清理、`on_xxx_clicked` 自动连接 |
 | 断线处理 | `disconnected` 信号 → `online` 置 0 → 从连接列表移除并 `deleteLater()`；异常掉线由心跳超时兜底 |
-| 连接保活 | 客户端 15s 心跳 + 服务端 35s 超时巡检；遍历连接列表时用副本 + `QPointer`，避免 `disconnectFromHost` 同步触发删除导致迭代器失效 |
+| 连接保活 | 客户端 15s 心跳 + 服务端 35s 超时巡检；遍历连接列表用副本 + `QPointer`，避免同步删除导致迭代器失效 |
 | 服务端并发模型 | 单线程事件循环 + 非阻塞 IO（Qt 内部封装 select / epoll） |
-| 内存管理 | `malloc` / `free` 配对、谁创建谁释放、柔性数组、转发前克隆 `PDU` 规避 use-after-free |
+| 内存管理 | `malloc` / `free` 配对、谁创建谁释放、柔性数组、转发前 `clonePdu()` 明确所有权 |
 | 数据库访问 | `QSqlDatabase` + `QSqlQuery`，全局单例复用连接；全部预处理绑定 |
 | 口令安全 | 每用户随机盐 + SHA-256，不存明文；旧数据登录时惰性升级 |
 | 路径安全 | `QDir::cleanPath` 消解 `..` 后与用户根目录做前缀比较（带分隔符，避免 `/alice2` 命中 `/alice`） |
-| 协议双端一致性 | 两份 `protocol.h` 必须逐字节一致（§5.1），枚举只能追加不能插队 |
+| 协议双端一致性 | 两份 `protocol.h` 必须逐字节一致（见 5.1），枚举只能追加不能插队 |
 
 ---
 
-## 十、说明
+## 十一、说明
 
 - 本仓库已通过 `.gitignore` 排除 `debug/`、`release/`、`Makefile*`、`moc_*`、`ui_*.h`、`*.o`、`*.exe`、`*.pro.user` 等编译产物与本机 IDE 配置，仅保留源码。
-- `项目总结.md` 是作者整理的中文面试复习文档，包含更详细的模块讲解与问答思路，可作为本 README 的补充阅读。
 - 数据库若从旧版本升级，请执行 [`sql/migrate_v2.sql`](sql/migrate_v2.sql)（加 `salt` 列、`pwd` 扩容、好友唯一键与去重）。
