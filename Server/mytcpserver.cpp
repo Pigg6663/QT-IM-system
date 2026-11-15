@@ -1,4 +1,5 @@
 #include "mytcpserver.h"
+#include <QByteArray>
 #include <QDebug>
 
 MyTcpServer::MyTcpServer()
@@ -16,18 +17,18 @@ void MyTcpServer::incomingConnection(qintptr handle)
     MyTcpSocket* pTcpSocket=new MyTcpSocket;
     pTcpSocket->setSocketDescriptor(handle);
     m_tcpSocketList.append(pTcpSocket);
-    for(int i=0;i<m_tcpSocketList.size();i++)
-    {
-        qDebug()<<m_tcpSocketList[i];
-    }
+    qDebug()<<"当前连接数"<<m_tcpSocketList.size();
 }
 
 void MyTcpServer::removeSocket(MyTcpSocket *mySocket)
 {
+    if (mySocket == NULL)
+    {
+        return;
+    }
     m_tcpSocketList.removeOne(mySocket);
     mySocket->deleteLater();
     mySocket=NULL;
-
 }
 
 void MyTcpServer::resend(char *caTarName, PDU *pdu)
@@ -36,19 +37,25 @@ void MyTcpServer::resend(char *caTarName, PDU *pdu)
     {
         return ;
     }
-    for(int i=0;i<m_tcpSocketList.size();i++)
+    // 注意：必须按字符串内容比较。
+    // 原始实现写的是 caTarName==m_strLoginName（char* 与 QString 比较），
+    // 实际比较的是裸指针地址，条件恒为 false，导致转发永远命中不了目标。
+    const QByteArray tarName(caTarName);
+    for (MyTcpSocket* sock : m_tcpSocketList)
     {
-        if(caTarName==m_tcpSocketList[i]->m_strLoginName)
+        if (sock == NULL)
         {
-            m_tcpSocketList[i]->write((char*)pdu,pdu->uiTotalLen);
-            qDebug()<<"resend respdu->uiTotaLen"<<pdu->uiTotalLen
-                              <<"pdu->uiMsgLen"<<pdu->uiMsgLen
-                              <<"pdu->uiType"<<pdu->uiType
-                              <<"pdu->caData"<<pdu->caData
-                              <<"pdu->caData+32"<<pdu->caData+32
-                              <<"pdu->caMsg"<<pdu->caMsg;
-                      break;
+            continue;
+        }
+        if (sock->m_strLoginName.toUtf8() == tarName)
+        {
+            sock->write((char*)pdu, pdu->uiTotalLen);
+            qDebug()<<"resend 命中 ->"<<sock->m_strLoginName
+                    <<"uiTotalLen"<<pdu->uiTotalLen
+                    <<"uiMsgLen"<<pdu->uiMsgLen
+                    <<"uiType"<<pdu->uiType;
+            return;
         }
     }
+    qDebug()<<"resend 未找到在线目标用户:"<<caTarName<<"，消息丢弃（无离线消息存储）";
 }
-

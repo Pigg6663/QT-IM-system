@@ -3,11 +3,14 @@
 #include "operatedb.h"
 #include "protocol.h"
 
+#include <QDebug>
+#include <cstring>
+
 MyTcpSocket::MyTcpSocket()
 {
-    m_pmh=new MsgHandler;
-connect(this,&QTcpSocket::readyRead,this,&MyTcpSocket::recvMsg);
-connect(this,&QTcpSocket::disconnected,this,&MyTcpSocket::clineOffliine);
+    m_pmh = new MsgHandler;
+    connect(this, &QTcpSocket::readyRead, this, &MyTcpSocket::recvMsg);
+    connect(this, &QTcpSocket::disconnected, this, &MyTcpSocket::clineOffliine);
 }
 
 MyTcpSocket::~MyTcpSocket()
@@ -15,11 +18,42 @@ MyTcpSocket::~MyTcpSocket()
     delete m_pmh;
 }
 
+// 收包状态机：处理半包(缓存等待)、粘包(循环切分)、非法长度(断开)
 void MyTcpSocket::recvMsg()
 {
-   PDU* pdu=readMsg();
-   PDU* respdu=handleMsg(pdu);
-   sendMsg(respdu);
+    m_recvBuf.append(this->readAll());
+
+    while (true)
+    {
+        // 1) 至少要够读到 4 字节的总长字段，才可能切出一个包
+        if (m_recvBuf.size() < int(sizeof(uint)))
+            break;
+
+        uint uiPDULen = 0;
+        memcpy(&uiPDULen, m_recvBuf.constData(), sizeof(uint));
+
+        // 2) 长度合法性校验：防下溢(uiPDULen < 76 时减法会溢出成约 42 亿)、防巨量分配
+        if (uiPDULen < PDU_HEADER_LEN || uiPDULen > PDU_MAX_TOTAL_LEN)
+        {
+            qWarning() << "非法包长:" << uiPDULen << "，断开连接";
+            m_recvBuf.clear();
+            this->disconnectFromHost();
+            return;
+        }
+
+        // 3) 半包：还没收齐，保留在缓冲区，等下一次 readyRead
+        if (m_recvBuf.size() < int(uiPDULen))
+            break;
+
+        // 4) 切出一个完整 PDU（mkPDU 内部会按 uiMsgLen 补足总长并清零）
+        PDU* pdu = mkPDU(uiPDULen - PDU_HEADER_LEN);
+        memcpy(pdu, m_recvBuf.constData(), uiPDULen);
+        m_recvBuf.remove(0, int(uiPDULen));
+
+        // 5) 业务处理（handleMsg 内部会 free(pdu)），再回包（sendMsg 内部也会 free）
+        PDU* respdu = handleMsg(pdu);
+        sendMsg(respdu);
+    }
 }
 
 void MyTcpSocket::sendMsg(PDU *pdu)
@@ -42,20 +76,12 @@ void MyTcpSocket::sendMsg(PDU *pdu)
 
 void MyTcpSocket::clineOffliine()
 {
-    operateDB::getInstance().handleOffline(m_strLoginName.toStdString().c_str());
+    // 未登录的连接没有登录名，不能拿空串去置 online=0
+    if (!m_strLoginName.isEmpty())
+    {
+        operateDB::getInstance().handleOffline(m_strLoginName.toStdString().c_str());
+    }
     MyTcpServer::getInstance().removeSocket(this);
-}
-
-PDU *MyTcpSocket::readMsg()
-{
-
-    qDebug()<<"readMsg接收消息长度"<<this->bytesAvailable();
-    uint uiPDULen=0;
-    this->read((char*)&uiPDULen,sizeof(uint));
-    uint uiMsgLen=uiPDULen-sizeof(PDU);
-    PDU*pdu=mkPDU(uiMsgLen);
-    this->read((char*)pdu+sizeof(uint),uiPDULen-sizeof(uint));
-    return pdu;
 }
 
 PDU *MyTcpSocket::handleMsg(PDU *pdu)
@@ -78,7 +104,7 @@ PDU *MyTcpSocket::handleMsg(PDU *pdu)
     case ENUM_TYPE_LOGIN_REQUEST:
     {
       respdu=m_pmh->login(m_strLoginName);
-        break;
+      break;
     }
     case ENUM_TYPE_FIND_USER_REQUEST:
     {
@@ -164,4 +190,3 @@ PDU *MyTcpSocket::handleMsg(PDU *pdu)
     pdu=NULL;
     return respdu;
 }
-

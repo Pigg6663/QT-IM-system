@@ -4,6 +4,7 @@
 #include "protocol.h"
 #include "reshandler.h"
 
+#include <QByteArray>
 #include <QTcpSocket>
 #include <QWidget>
 
@@ -20,7 +21,6 @@ public:
     void loadConfig();
     static Client& getInstance();
     void sendMsg(PDU*pdu);
-    PDU* readMsg();
     void handleMsg(PDU*pdu);
      QString m_strIP;
      quint16 m_usPort;
@@ -42,6 +42,7 @@ private slots:
 
 private:
     Ui::Client *ui;
+    QByteArray m_recvBuf;        // 接收缓冲区：处理半包与粘包
     Client(QWidget*parent=nullptr);
     Client(const Client& instance)=delete;
     Client& operator=(const Client&)=delete;

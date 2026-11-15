@@ -41,6 +41,11 @@ enum ENUM_TYPE{
     ENUM_TYPE_DOWNLOAD_FILE_RESPOND,
     ENUM_TYPE_SHARE_FILE_REQUEST,
     ENUM_TYPE_SHARE_FILE_RESPOND,
+    // ---- 深化阶段新增：必须追加在末尾，保证既有消息数值不变 ----
+    // 两份 protocol.h 的枚举顺序必须完全一致，协议靠数值传输
+    ENUM_TYPE_HEARTBEAT_REQUEST,
+    ENUM_TYPE_HEARTBEAT_RESPOND,
+    ENUM_TYPE_KICKED_RESEND,
     ENUM_TYPE_MAX=99999,
 };
 
@@ -51,6 +56,14 @@ struct PDU{
     char caData[64];
     char caMsg[];
 };
+
+// ---- 协议常量（两端必须一致）----
+// caMsg[] 是 C99 柔性数组，sizeof 计算时占 0 字节，故头部固定 76 = 3*4 + 64
+constexpr unsigned int PDU_HEADER_LEN    = 76;
+constexpr unsigned int PDU_MAX_TOTAL_LEN = 8u * 1024u * 1024u;  // 单包上限 8MB
+
+// 编译期锁定头部布局：把"依赖编译器假设"变成"编译期强制约束"
+static_assert(sizeof(PDU) == 76, "PDU header layout broken");
 
 PDU *mkPDU(uint uiMsgLen=0);
 

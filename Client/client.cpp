@@ -7,6 +7,8 @@
 #include<QDebug>
 #include <QHostAddress>
 #include <QMessageBox>
+#include <cstring>
+
 Client::Client(QWidget *parent)
     : QWidget(parent)
     , ui(new Ui::Client)
@@ -18,6 +20,7 @@ Client::Client(QWidget *parent)
 
     connect(&m_socket,&QTcpSocket::connected,this,&Client::showConnect);
     connect(&m_socket,&QTcpSocket::readyRead,this,&Client::recvMsg);
+
     m_prh = new ResHandler();
 }
 Client &Client::getInstance()
@@ -40,26 +43,69 @@ void Client::loadConfig()
         qDebug() <<"打开文件失败";
         return;
     }
-    QByteArray baData=file.readAll();
-    QString strData=QString(baData);
-    qDebug()<<"strData"<<strData;
-    QStringList strList=strData.split("\r\n");
-    m_strIP=strList[0];
-    m_usPort=strList[1].toUShort();
-    qDebug()<<"ip"<<m_strIP<<"port"<<m_usPort;
-
-
+    // 逐行读取，不硬编码 "\r\n"：配置文件若为 LF 换行，split("\r\n") 会取不到端口
+    const QByteArray baData = file.readAll();
     file.close();
+
+    QStringList strList;
+    for (const QByteArray& line : baData.split('\n'))
+    {
+        const QString one = QString::fromUtf8(line).trimmed();
+        if (!one.isEmpty())
+        {
+            strList.append(one);
+        }
+    }
+
+    if (strList.size() < 2)
+    {
+        qWarning() << "配置文件格式非法，期望两行(IP/端口)，实际行数:" << strList.size();
+        return;
+    }
+
+    m_strIP  = strList.at(0);
+    m_usPort = strList.at(1).toUShort();
+    if (m_usPort == 0)
+    {
+        qWarning() << "端口解析失败，原始值:" << strList.at(1);
+    }
+    qDebug()<<"ip"<<m_strIP<<"port"<<m_usPort;
 }
 void Client::showConnect()
 {
     qDebug()<<"链接成功";
 }
 
+// 收包状态机：处理半包(缓存等待)、粘包(循环切分)、非法长度(断开)
 void Client::recvMsg()
 {
-    PDU* pdu =readMsg();
-    handleMsg(pdu);
+    m_recvBuf.append(m_socket.readAll());
+
+    while (true)
+    {
+        if (m_recvBuf.size() < int(sizeof(uint)))
+            break;
+
+        uint uiPDULen = 0;
+        memcpy(&uiPDULen, m_recvBuf.constData(), sizeof(uint));
+
+        if (uiPDULen < PDU_HEADER_LEN || uiPDULen > PDU_MAX_TOTAL_LEN)
+        {
+            qWarning() << "客户端收到非法包长:" << uiPDULen << "，断开连接";
+            m_recvBuf.clear();
+            m_socket.disconnectFromHost();
+            return;
+        }
+
+        if (m_recvBuf.size() < int(uiPDULen))
+            break;
+
+        PDU* pdu = mkPDU(uiPDULen - PDU_HEADER_LEN);
+        memcpy(pdu, m_recvBuf.constData(), uiPDULen);
+        m_recvBuf.remove(0, int(uiPDULen));
+
+        handleMsg(pdu);        // 内部会 free(pdu)
+    }
 }
 
 void Client::sendMsg(PDU *pdu)
@@ -73,17 +119,6 @@ void Client::sendMsg(PDU *pdu)
             <<"pdu->caMsg"<<pdu->caMsg;
     free(pdu);
     pdu=NULL;
-}
-
-PDU *Client::readMsg()
-{
-    qDebug()<<"recvMsg接收消息长度"<<m_socket.bytesAvailable();
-    uint uiPDULen=0;
-    m_socket.read((char*)&uiPDULen,sizeof(uint));
-    uint uiMsgLen=uiPDULen-sizeof(PDU);
-    PDU*pdu=mkPDU(uiMsgLen);
-    m_socket.read((char*)pdu+sizeof(uint),uiPDULen-sizeof(uint));
-    return pdu;
 }
 
 void Client::handleMsg(PDU *pdu)
