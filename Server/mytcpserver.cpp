@@ -49,8 +49,8 @@ void MyTcpServer::resend(char *caTarName, PDU *pdu)
         return ;
     }
     // 注意：必须按字符串内容比较。
-    // 原始实现写的是 caTarName==m_strLoginName（char* 与 QString 比较），
-    // 实际比较的是裸指针地址，条件恒为 false，导致转发永远命中不了目标。
+// 原实现依赖 char* 到 QString 的隐式 ASCII 转换来完成比较，逻辑上可行，
+// 但依赖隐式转换且要求 caData 已按 0 填充。这里改为显式 QByteArray 比较，消除歧义。
     const QByteArray tarName(caTarName);
     for (const QPointer<MyTcpSocket>& sock : m_tcpSocketList)
     {
