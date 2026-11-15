@@ -366,6 +366,9 @@ powershell -ExecutionPolicy Bypass -File tests\test_security.ps1
 
 ## 九、问题与修复记录
 
+本节记录**问题清单与修复状态**。复查过程、误判记录、测试设计教训与可复用的排查清单，
+见 [`docs/REVIEW-NOTES.md`](docs/REVIEW-NOTES.md)。
+
 本节是开发完成后的自我 code review 记录：先系统梳理出全部问题，再分三个阶段逐项修复，
 **下表是真实状态**，未完成的条目仍在待办中。
 
