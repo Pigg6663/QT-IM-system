@@ -20,6 +20,8 @@ public:
 
     // 按登录名查找在线连接，找不到返回 nullptr
     MyTcpSocket* findByLoginName(const QString& name);
+    // 该登录名是否还有 except 之外的有效在线连接（用于断线时不误置 offline）
+    bool hasOtherActiveSession(const QString& name, MyTcpSocket* except);
     // 踢掉除 except 之外所有同名在线连接，返回是否踢掉了至少一个
     bool kickDuplicate(const QString& name, MyTcpSocket* except);
 

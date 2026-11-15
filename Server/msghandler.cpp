@@ -9,6 +9,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include<QStringList>
+#include <QByteArray>
 
 namespace {
 // 当前用户网盘的绝对路径根：<m_strRootPath>/<登录名>
@@ -87,6 +88,35 @@ PDU* MsgHandler::makeBoolRespond(ENUM_TYPE type, bool ret) const
     return respdu;
 }
 
+// ---------------------------------------------------------------
+// 身份绑定校验
+// 协议里部分请求的 caData 前 32 字节是"发起者自己"（聊天/加好友/删好友/
+// 分享文件等）。这个字段由客户端填写，服务端不能直接信任——否则任何已登录
+// 账号都能把自己的名字写成别人，以对方身份发消息、加好友、删好友关系。
+// 这里要求它与当前连接的登录名严格一致，不一致一律拒绝。
+// ---------------------------------------------------------------
+bool MsgHandler::isOwnIdentity(const char* caClaimedName) const
+{
+    if (caClaimedName == NULL || m_loginName.isEmpty())
+    {
+        return false;
+    }
+    // caData 是定长 32 字节字段，显式限制长度，避免字段未以 0 结尾时越界读
+    const QString claimed = QString::fromUtf8(caClaimedName, int(qstrnlen(caClaimedName, 32)));
+    if (claimed.isEmpty())
+    {
+        return false;
+    }
+    return claimed == m_loginName;
+}
+
+PDU* MsgHandler::makeIdentityRejectRespond(ENUM_TYPE respondType) const
+{
+    qWarning() << "身份校验失败：会话用户为" << m_loginName
+               << "，但请求声称的操作者不是本人，已拒绝";
+    return makeBoolRespond(respondType, false);
+}
+
 PDU *MsgHandler::regist()
 {
     char caName[32]={'\0'};
@@ -158,6 +188,11 @@ PDU *MsgHandler::addFriend()
     char caTarName[32]={'\0'};
     memcpy(caCurName,pdu->caData,32);
     memcpy(caTarName,pdu->caData+32,32);
+    // 身份校验：caData 前半段的"发起者"必须是本连接的真实登录用户
+    if (!isOwnIdentity(caCurName))
+    {
+        return makeIdentityRejectRespond(ENUM_TYPE_ADD_FRIEND_RESPOND);
+    }
     int ret =operateDB::getInstance().handleAddFriend(caCurName,caTarName);
     if(ret==1)
     {
@@ -181,6 +216,11 @@ PDU *MsgHandler::addFriendAgree()
     char caTarName[32]={'\0'};
     memcpy(caCurName,pdu->caData,32);
     memcpy(caTarName,pdu->caData+32,32);
+    // 身份校验：只能以自己名义同意好友申请，不能替别人同意
+    if (!isOwnIdentity(caCurName))
+    {
+        return makeIdentityRejectRespond(ENUM_TYPE_ADD_FRIEND_AGREE_RESPOND);
+    }
     bool ret =operateDB::getInstance().handleAddFriendAGree(caCurName,caTarName);
     qDebug()<<"addFriendAgree ret"<<ret;
     PDU*respdu=mkPDU();
@@ -196,8 +236,15 @@ PDU *MsgHandler::addFriendAgree()
 
 PDU *MsgHandler::flushFriend()
 {
+    char caCurName[32]={'\0'};
+    memcpy(caCurName,pdu->caData,32);
+    // 身份校验：只能查自己的好友列表
+    if (!isOwnIdentity(caCurName))
+    {
+        return makeIdentityRejectRespond(ENUM_TYPE_FLUSH_FRIEND_RESPOND);
+    }
     QStringList res =
-    operateDB::getInstance().handleFlushFriend(pdu->caData);
+    operateDB::getInstance().handleFlushFriend(caCurName);
        PDU* respdu = mkPDU(res.size()*32);
        respdu->uiType = ENUM_TYPE_FLUSH_FRIEND_RESPOND;
        for (int i=0; i<res.size(); i++) {
@@ -212,6 +259,11 @@ PDU *MsgHandler::delFriend()
         char tarName[32] = {'\0'};
         memcpy(curName, pdu->caData, 32);
         memcpy(tarName, pdu->caData+32, 32);
+        // 身份校验：不能替别人删除好友关系
+        if (!isOwnIdentity(curName))
+        {
+            return makeIdentityRejectRespond(ENUM_TYPE_DEL_FRIEND_RESPOND);
+        }
 
         bool ret = operateDB::getInstance().handleDelFriend(curName, tarName);
         qDebug() << "delFriend ret: " << ret;
@@ -225,8 +277,17 @@ PDU *MsgHandler::delFriend()
 
 PDU *MsgHandler::chat()
 {
+    char caCurName[32] = {'\0'};
     char tarName[32] = {'\0'};
+    memcpy(caCurName, pdu->caData, 32);
     memcpy(tarName, pdu->caData+32, 32);
+    // 身份校验：caData 前半段是"发送者"，必须是自己，否则就是冒名发言。
+    // 聊天请求没有应答包，校验失败直接静默丢弃。
+    if (!isOwnIdentity(caCurName))
+    {
+        qWarning() << "聊天身份校验失败：会话用户" << m_loginName << "试图以他人名义发送消息，已丢弃";
+        return NULL;
+    }
     // 转发独立拷贝，避免原 pdu 被 handleMsg 释放后接收方读到已释放内存
     PDU* resendPdu = clonePdu(pdu);
     resendPdu->uiType = ENUM_TYPE_CHAT_RESEND;

@@ -379,9 +379,13 @@ powershell -ExecutionPolicy Bypass -File tests\test_security.ps1
 | 8 | 无离线消息，对方离线即丢弃 | ⏳ 待办 | 计划消息落库 + 登录后推送 |
 | 9 | 服务端单线程处理，慢操作阻塞全部连接 | ⏳ 待办 | 连接层留在主线程（`QTcpSocket` 有线程亲和性），业务投递线程池；`QSqlDatabase` 需每线程独立连接 |
 | 10 | 聊天窗口全局复用，跨会话串消息、可能回复错人 | ⏳ 待办 | 计划按好友维度维护 `QMap<QString, Chat*>` |
+| 11 | 重复登录踢人后，账号被错误置为离线 | ✅ 已修复 | 断线时先判定是否还有同名有效连接，有则保持 `online = 1` |
+| 12 | 服务端不校验操作身份，可冒充他人 | ✅ 已修复 | 分发入口加登录态拦截 + `caData` 自称身份与会话登录名强校验 |
 
 关于第 9 项：Qt 的 `QSqlDatabase` 连接与创建它的线程绑定，不能跨线程共享。
 所以"直接加线程池"是错的，正确顺序是先做连接管理（每线程独立连接 / 连接池），再线程化业务——这个取舍本身值得展开讲。
+
+第 11、12 项是后期复查中发现的两处缺陷，详见 9.8。
 
 ### 9.2 健壮性：收包状态机（第 1 项）
 
@@ -475,7 +479,95 @@ if (sock->m_strLoginName.toUtf8() == tarName) // 显式内容比较，无隐式�
 > 这两条值得单独记下来：code review 里"看起来可疑"和"确实是 bug"要分开，
 > 后者需要能复现的验证，前者应该写成"建议"而不是断言缺陷。
 
-### 9.6 测试脚本与验证方式
+### 9.6 身份校验与在线状态（第 11、12 项）
+
+这两处是后期复查中发现的缺陷，都会造成实际后果。
+
+**第 11 项：重复登录互踢后，账号被错误置为离线**
+
+踢人的时序是这样的：新连接登录 → `handleLogin()` 把 `online` 置 1 → `kickDuplicate()` 断开旧连接
+→ 旧连接触发 `disconnected` → `clineOffliine()` **无条件**执行 `handleOffline()` 把 `online` 置 0。
+结果：新连接明明还在线，数据库里却已经变成离线，好友列表和消息转发都会认为该用户不在线。
+
+修复思路：断线时先确认该账号是否还有其它**有效在线连接**，有则不动 `online`。
+
+```cpp
+void MyTcpSocket::clineOffliine()
+{
+    if (!m_strLoginName.isEmpty())
+    {
+        // 只要还有同名连接在线，就不能把 online 置 0
+        if (MyTcpServer::getInstance().hasOtherActiveSession(m_strLoginName, this))
+        {
+            qDebug() << "账号" << m_strLoginName << "仍有其它在线连接，保持 online=1";
+        }
+        else
+        {
+            operateDB::getInstance().handleOffline(m_strLoginName.toStdString().c_str());
+        }
+    }
+    MyTcpServer::getInstance().removeSocket(this);
+}
+```
+
+`hasOtherActiveSession()` 会排除自己、排除已在 `UnconnectedState` 的连接（正在断开的不算有效在线）。
+这比"给被踢连接打一个 `m_bKicked` 标记"更通用：它同样能处理"用户开两个客户端"这类历史上没有约束的情况。
+
+**第 12 项：服务端不校验操作身份，可冒充他人**
+
+协议里部分请求的 `caData` 前 32 字节是"发起者自己"（聊天、加好友、同意加好友、刷新好友、删好友）。
+原实现直接采信这个字段，于是任何已登录账号都能：
+
+| 伪造方式 | 后果 |
+|---|---|
+| `CHAT_REQUEST` 把 `caData[0:32]` 写成别人 | 以他人名义发言，接收方看到的是被冒名者 |
+| `ADD_FRIEND_REQUEST` 冒名 | 以他人名义建立好友关系 |
+| `ADD_FRIEND_AGREE_REQUEST` 冒名 | 替受害者同意好友申请 |
+| `FLUSH_FRIEND_REQUEST` 冒名 | 查看他人好友列表 |
+| `DEL_FRIEND_REQUEST` 冒名 | 删除他人的好友关系 |
+
+更基础的问题是：**未登录的 TCP 连接也能直接调用业务接口**（网盘操作只校验路径在 `userdata/<登录名>/` 内，
+而 `登录名为空` 时这个校验对空目录恰好成立）。
+
+修复分两道：
+
+1. **分发入口拦截**（`MyTcpSocket::handleMsg`）：除注册、登录、心跳外，`m_strLoginName` 为空一律拒绝：
+
+```cpp
+if (m_strLoginName.isEmpty()
+    && pdu->uiType != ENUM_TYPE_REGIST_REQUEST
+    && pdu->uiType != ENUM_TYPE_LOGIN_REQUEST
+    && pdu->uiType != ENUM_TYPE_HEARTBEAT_REQUEST)
+{
+    qWarning() << "未登录连接尝试调用业务接口, uiType=" << pdu->uiType << "，已拒绝";
+    free(pdu);
+    return NULL;
+}
+```
+
+2. **身份绑定校验**（`MsgHandler::isOwnIdentity`）：`caData` 里自称的用户必须等于会话登录名：
+
+```cpp
+bool MsgHandler::isOwnIdentity(const char* caClaimedName) const
+{
+    if (caClaimedName == NULL || m_loginName.isEmpty()) return false;
+    // caData 是定长 32 字节字段，显式限长，避免字段未以 0 结尾时越界读
+    const QString claimed = QString::fromUtf8(caClaimedName, int(qstrnlen(caClaimedName, 32)));
+    return !claimed.isEmpty() && claimed == m_loginName;
+}
+```
+
+覆盖 `chat` / `addFriend` / `addFriendAgree` / `flushFriend` / `delFriend` 五处。
+聊天请求没有应答包，校验失败直接静默丢弃（不回应，避免给攻击者反馈）。
+
+`shareFile` 虽然没有身份字段，但源路径必须落在 `userdata/<会话登录名>/` 内（第 4 项的路径约束），
+已隐式绑定会话身份，且它不转发发送者姓名，因此**无法冒充**——不需要额外加字段。
+
+> 设计取舍：身份校验失败的应答尽量与"业务失败"保持同形。
+> 例如 `FLUSH_FRIEND_RESPOND` 本身不承载 `bool`，拒绝时返回空列表，
+> 与"确实没有好友"在线上不可区分——这样既不泄漏信息，也不用改协议。
+
+### 9.7 测试脚本与验证方式
 
 `tests/` 下的脚本**手工构造 PDU 字节流**，不依赖 GUI，可直接复现上述修复：
 
@@ -485,14 +577,20 @@ if (sock->m_strLoginName.toUtf8() == tarName) // 显式内容比较，无隐式�
 | `tests/test_protocol.ps1` | 粘包（两包一次写）、半包（40+36 分两次写）、非法包长（10 字节）、超大包长（100MB）、异常后服务存活 | 6 / 6 通过 |
 | `tests/test_heartbeat.ps1` | 心跳应答、重复登录互踢、异常掉线 35s 超时回收 | 8 / 8 通过 |
 | `tests/test_security.ps1` | SQL 注入被拒、口令哈希格式、错误口令、路径越权（列目录 / mkdir，并验证未落盘）、合法路径回归、历史明文自动升级 | 14 / 14 通过 |
+| `tests/test_auth.ps1` | 未登录调用业务接口被拒、冒名聊天 / 加好友 / 删好友 / 查好友列表被拒、合法操作未误杀；互踢后 `online` 仍为 1、唯一连接断开后归 0 | 18 / 18 通过 |
 
-### 9.7 已知取舍（暂不处理）
+> `test_protocol.ps1` 的用例需要**先登录**才能触发业务应答（服务端已加登录态校验），
+> 脚本里封装了 `New-AuthenticatedClient`。
+
+### 9.8 已知取舍（暂不处理）
 
 - 未引入单元测试框架，验证方式为协议级脚本 + 双客户端手动联调；
 - 服务端无界面，运行日志依赖 `qDebug()` 输出；
 - 服务端与客户端地址通过 `.qrc` 编译进可执行文件，修改需重新构建；
 - 好友关系以无向表存储，查询时需 `union` 双向匹配；数据量大时可冗余存储双向关系换取查询性能；
-- 未做 TLS，协议为明文传输，仅适用于内网 / 本机演示场景。
+- 未做 TLS，协议为明文传输，仅适用于内网 / 本机演示场景；
+- `caData` 里的身份是"客户端自称 + 服务端校验"，仍依赖两端字段约定一致；
+  更彻底的做法是身份只由会话决定、协议里根本不传"我是谁"，但那需要改客户端与协议格式。
 
 ---
 
@@ -505,7 +603,7 @@ if (sock->m_strLoginName.toUtf8() == tarName) // 显式内容比较，无隐式�
 | 二进制协议 vs JSON | 自定义 PDU 紧凑高效、解析快、字段定长易对齐；代价是可读性差、`caData[64]` 扩展性受限 |
 | 单例模式 | `Client` / `Index` / `File` / `Server` / `MyTcpServer` / `operateDB` 均为单例：Meyers 局部静态变量（C++11 线程安全）+ `delete` 拷贝构造与赋值 |
 | 信号槽机制 | `readyRead → recvMsg` 异步收发、`disconnected → clineOffliine` 断线清理、`on_xxx_clicked` 自动连接 |
-| 断线处理 | `disconnected` 信号 → `online` 置 0 → 从连接列表移除并 `deleteLater()`；异常掉线由心跳超时兜底 |
+| 断线处理 | `disconnected` 信号 → 判定是否仍有同名在线连接 → 无则 `online` 置 0 → `deleteLater()`；异常掉线由心跳超时兜底 |
 | 连接保活 | 客户端 15s 心跳 + 服务端 35s 超时巡检；遍历连接列表用副本 + `QPointer`，避免同步删除导致迭代器失效 |
 | 服务端并发模型 | 单线程事件循环 + 非阻塞 IO（Qt 内部封装 select / epoll） |
 | 内存管理 | `malloc` / `free` 配对、谁创建谁释放、柔性数组、转发前 `clonePdu()` 明确所有权 |

@@ -13,16 +13,19 @@ $script:pass = 0
 $script:fail = 0
 
 function New-TestPdu {
-    param([uint32]$Type, [byte[]]$Msg = @(), [string]$Data64 = "")
+    # Data64 同时接受字符串（UTF-8 编码后放入）和 64 字节数组（直接拷贝）
+    param([uint32]$Type, [byte[]]$Msg = @(), [object]$Data64 = "")
     $len = 76 + $Msg.Length
     $buf = New-Object System.Collections.Generic.List[byte]
     $buf.AddRange([BitConverter]::GetBytes([uint32]$len))        # uiTotalLen
     $buf.AddRange([BitConverter]::GetBytes([uint32]$Msg.Length)) # uiMsgLen
     $buf.AddRange([BitConverter]::GetBytes([uint32]$Type))       # uiType
     $data = New-Object byte[] 64
-    if ($Data64.Length -gt 0) {
-        $sb = [System.Text.Encoding]::UTF8.GetBytes($Data64)
-        [Array]::Copy($sb, $data, [Math]::Min($sb.Length, 64))
+    if ($Data64 -is [byte[]]) {
+        [Array]::Copy($Data64, 0, $data, 0, [Math]::Min($Data64.Length, 64))
+    } elseif ($Data64.Length -gt 0) {
+        $sb = [System.Text.Encoding]::UTF8.GetBytes([string]$Data64)
+        [Array]::Copy($sb, 0, $data, 0, [Math]::Min($sb.Length, 64))
     }
     $buf.AddRange($data)                                         # caData[64]
     if ($Msg.Length -gt 0) { $buf.AddRange($Msg) }               # caMsg
@@ -64,13 +67,55 @@ function Test-Result {
 
 $ONLINEUSER_REQUEST  = 7
 $ONLINEUSER_RESPOND  = 8
+$REGIST_REQUEST      = 1
+$REGIST_RESPOND      = 2
+$LOGIN_REQUEST       = 3
+$LOGIN_RESPOND       = 4
+
+# 服务端已加入登录态校验：除注册/登录/心跳外，未登录连接一律拒绝。
+# 所以用于验证拆包的业务请求必须先登录。
+$script:testUser = "proto_test_$([DateTime]::Now.ToString('HHmmss'))"
+$script:testPwd  = "pwd123"
+
+function New-AuthenticatedClient {
+    param([string]$User, [string]$Pwd)
+
+    # 构造 64 字节 caData：前 32 字节用户名，后 32 字节密码
+    $data = New-Object byte[] 64
+    $u = [System.Text.Encoding]::UTF8.GetBytes($User)
+    $p = [System.Text.Encoding]::UTF8.GetBytes($Pwd)
+    [Array]::Copy($u, 0, $data, 0,  [Math]::Min($u.Length, 32))
+    [Array]::Copy($p, 0, $data, 32, [Math]::Min($p.Length, 32))
+
+    # 先注册（已存在则忽略结果）
+    $c0 = New-Object System.Net.Sockets.TcpClient($ServerIp, $Port)
+    $s0 = $c0.GetStream()
+    $reg = New-TestPdu -Type $REGIST_REQUEST -Data64 $data
+    $s0.Write($reg, 0, $reg.Length)
+    $null = Read-Pdu -Stream $s0
+    $c0.Close()
+
+    # 登录
+    $c = New-Object System.Net.Sockets.TcpClient($ServerIp, $Port)
+    $c.NoDelay = $true
+    $s = $c.GetStream()
+    $login = New-TestPdu -Type $LOGIN_REQUEST -Data64 $data
+    $s.Write($login, 0, $login.Length)
+    $resp = Read-Pdu -Stream $s
+    if ($resp.Type -ne $LOGIN_RESPOND) {
+        $c.Close()
+        throw "登录失败: type=$($resp.Type)"
+    }
+    return $c
+}
 
 Write-Host "`n=== 协议层测试 ($ServerIp`:$Port) ===`n" -ForegroundColor Cyan
+Write-Host "注意：业务请求需已登录（服务端有登录态校验）`n" -ForegroundColor DarkGray
 
 # ---------- 测试 1：粘包（一次写两个 PDU）----------
 Write-Host "[测试1] 粘包：2 个 PDU 一次性写入" -ForegroundColor Yellow
 try {
-    $c = New-Object System.Net.Sockets.TcpClient($ServerIp, $Port)
+    $c = New-AuthenticatedClient -User $script:testUser -Pwd $script:testPwd
     $s = $c.GetStream()
     $pdu = New-TestPdu -Type $ONLINEUSER_REQUEST
     $two = New-Object byte[] ($pdu.Length * 2)
@@ -87,7 +132,7 @@ try {
 # ---------- 测试 2：半包（一个 PDU 分两次写）----------
 Write-Host "`n[测试2] 半包：一个 PDU 拆成 40 + 36 字节两次写入，间隔 600ms" -ForegroundColor Yellow
 try {
-    $c = New-Object System.Net.Sockets.TcpClient($ServerIp, $Port)
+    $c = New-AuthenticatedClient -User $script:testUser -Pwd $script:testPwd
     $c.NoDelay = $true
     $s = $c.GetStream()
     $pdu = New-TestPdu -Type $ONLINEUSER_REQUEST
@@ -146,13 +191,15 @@ try {
 } catch { Test-Result "超大包长测试" $false $_.Exception.Message }
 
 # ---------- 测试 5：服务端仍存活 ----------
-Write-Host "`n[测试5] 服务端存活检查：正常连接是否仍能应答" -ForegroundColor Yellow
+Write-Host "`n[测试5] 服务端存活检查：异常包之后新连接仍能正常应答" -ForegroundColor Yellow
 try {
-    $c = New-Object System.Net.Sockets.TcpClient($ServerIp, $Port)
+    # 同样需要先登录（业务接口有登录态校验）
+    $c = New-AuthenticatedClient -User $script:testUser -Pwd $script:testPwd
     $s = $c.GetStream()
-    $s.Write((New-TestPdu -Type $ONLINEUSER_REQUEST), 0, 76)
+    $req = New-TestPdu -Type $ONLINEUSER_REQUEST
+    $s.Write($req, 0, $req.Length)
     $r = Read-Pdu -Stream $s
-    Test-Result "异常包之后服务端仍正常服务" ($r.Type -eq $ONLINEUSER_RESPOND)
+    Test-Result "异常包之后服务端仍正常服务" ($r.Type -eq $ONLINEUSER_RESPOND) "(type=$($r.Type))"
     $c.Close()
 } catch { Test-Result "服务端存活" $false $_.Exception.Message }
 

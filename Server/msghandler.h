@@ -48,6 +48,13 @@ private:
                              PDU** outRespond) const;
     // 构造一个只带 bool 结果的应答包
     PDU* makeBoolRespond(ENUM_TYPE type, bool ret) const;
+
+    // 身份绑定校验：caData 前 32 字节里的"当前用户"必须与会话登录名一致，
+    // 不一致说明客户端在冒充别人，直接拒绝。
+    bool isOwnIdentity(const char* caClaimedName) const;
+
+    // 身份校验失败时构造失败应答
+    PDU* makeIdentityRejectRespond(ENUM_TYPE respondType) const;
 };
 
 #endif // MSGHANDLER_H

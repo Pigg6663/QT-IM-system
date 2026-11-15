@@ -87,6 +87,32 @@ MyTcpSocket* MyTcpServer::findByLoginName(const QString& name)
     return nullptr;
 }
 
+bool MyTcpServer::hasOtherActiveSession(const QString& name, MyTcpSocket* except)
+{
+    if (name.isEmpty())
+    {
+        return false;
+    }
+    for (const QPointer<MyTcpSocket>& sock : m_tcpSocketList)
+    {
+        if (sock.isNull() || sock.data() == except)
+        {
+            continue;
+        }
+        if (sock->m_strLoginName != name)
+        {
+            continue;
+        }
+        // 已在断开流程里的连接不算"有效在线"
+        if (sock->state() == QAbstractSocket::UnconnectedState)
+        {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
 bool MyTcpServer::kickDuplicate(const QString& name, MyTcpSocket* except)
 {
     if (name.isEmpty())

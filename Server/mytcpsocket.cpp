@@ -80,7 +80,17 @@ void MyTcpSocket::clineOffliine()
     // 未登录的连接没有登录名，不能拿空串去置 online=0
     if (!m_strLoginName.isEmpty())
     {
-        operateDB::getInstance().handleOffline(m_strLoginName.toStdString().c_str());
+        // 关键：只有当该账号确实没有其它有效在线连接时才置 offline。
+        // 否则"重复登录互踢"会出问题：新连接登录时已把 online 置 1，
+        // 紧接着旧连接被 disconnectFromHost 触发本函数，会把新连接的状态覆盖回 0。
+        if (MyTcpServer::getInstance().hasOtherActiveSession(m_strLoginName, this))
+        {
+            qDebug()<<"账号"<<m_strLoginName<<"仍有其它在线连接，保持 online=1";
+        }
+        else
+        {
+            operateDB::getInstance().handleOffline(m_strLoginName.toStdString().c_str());
+        }
     }
     MyTcpServer::getInstance().removeSocket(this);
 }
@@ -97,6 +107,19 @@ PDU *MyTcpSocket::handleMsg(PDU *pdu)
     m_pmh->pdu=pdu;
     // 每次分发前把当前登录名同步给业务层，供网盘路径越权校验使用
     m_pmh->m_loginName = m_strLoginName;
+
+    // 身份校验（第一道）：除注册、登录、心跳外，其余请求都必须是已登录连接。
+    // 否则未登录的 TCP 连接可以直接调用网盘操作、查好友列表等业务。
+    if (m_strLoginName.isEmpty()
+        && pdu->uiType != ENUM_TYPE_REGIST_REQUEST
+        && pdu->uiType != ENUM_TYPE_LOGIN_REQUEST
+        && pdu->uiType != ENUM_TYPE_HEARTBEAT_REQUEST)
+    {
+        qWarning() << "未登录连接尝试调用业务接口, uiType=" << pdu->uiType << "，已拒绝";
+        free(pdu);
+        return NULL;
+    }
+
     switch(pdu->uiType)
     {
     case ENUM_TYPE_REGIST_REQUEST:
