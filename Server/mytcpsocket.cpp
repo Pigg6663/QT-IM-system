@@ -12,6 +12,9 @@
 MyTcpSocket::MyTcpSocket()
 {
     m_pmh = new MsgHandler;
+    // 让处理器知道是哪条连接在用它：递归删除、分享拷贝这类慢操作下沉线程池后，
+    // 结果要排队回到本连接所在线程才能写 socket
+    m_pmh->setSocket(this);
     connect(this, &QTcpSocket::readyRead, this, &MyTcpSocket::recvMsg);
     connect(this, &QTcpSocket::disconnected, this, &MyTcpSocket::clineOffliine);
     // 写缓冲腾空后接着推下一批分片：没有这个信号，要么一次全写进内存，

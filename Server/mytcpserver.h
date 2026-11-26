@@ -17,7 +17,7 @@ public:
     void incomingConnection(qintptr handle) override;
     void removeSocket(MyTcpSocket *mySocket);
     // 转发给在线用户；目标不在线时返回 false（由调用方决定是否落库）
-    bool resend(char *caTarName,PDU *pdu);
+    bool resend(const char *caTarName,PDU *pdu);
 
     // 按登录名查找在线连接，找不到返回 nullptr
     MyTcpSocket* findByLoginName(const QString& name);

@@ -1,5 +1,7 @@
 #include "msghandler.h"
+#include "filetask.h"
 #include "mytcpserver.h"
+#include "mytcpsocket.h"
 #include "operatedb.h"
 #include "server.h"
 #include"stdlib.h"
@@ -32,6 +34,17 @@ PDU* clonePdu(const PDU* src)
     PDU* dst = mkPDU(src->uiMsgLen);
     memcpy(dst, src, src->uiTotalLen);
     return dst;
+}
+
+// 构造一个只带 bool 结果的应答包。
+// 之所以做成自由函数而不是成员函数：慢操作的回调是在线程池跑完之后才执行的，
+// 那时 MsgHandler 可能已经随连接一起析构，回调里不能再依赖 this。
+PDU* makeBoolPdu(ENUM_TYPE type, bool ret)
+{
+    PDU* respdu = mkPDU();
+    respdu->uiType = type;
+    memcpy(respdu->caData, &ret, sizeof(bool));
+    return respdu;
 }
 }
 
@@ -82,10 +95,7 @@ bool MsgHandler::isSafePathOrRespond(const QString& strPath,
 
 PDU* MsgHandler::makeBoolRespond(ENUM_TYPE type, bool ret) const
 {
-    PDU* respdu = mkPDU();
-    respdu->uiType = type;
-    memcpy(respdu->caData, &ret, sizeof(bool));
-    return respdu;
+    return makeBoolPdu(type, ret);
 }
 
 // ---------------------------------------------------------------
@@ -373,17 +383,31 @@ PDU *MsgHandler::delDir()
         return errRespond;
     }
 
-    QFileInfo fileInfo(strPath);
-    bool ret = false;
-    if (fileInfo.isDir()) {
-        QDir dir(strPath);
-        ret = dir.removeRecursively();
-    } else {
-        QFile file(strPath);
-        ret = file.remove();
-    }
-    qDebug() << "delDir ret:" << ret;
-    return makeBoolRespond(ENUM_TYPE_DEL_DIR_RESPOND, ret);
+    // 递归删除一个装满小文件的目录可能要几秒甚至更久。同步做会把主线程的事件
+    // 循环完全堵死——这段时间里所有连接的心跳、聊天、刷新目录都不会被处理。
+    // 这里下沉到线程池，删除完成后再排队把应答发回本连接。
+    const QPointer<MyTcpSocket> socketGuard = m_pSocket;
+    FileTask::runAsync(socketGuard, [strPath]()
+    {
+        const QFileInfo fileInfo(strPath);
+        if (fileInfo.isDir())
+        {
+            return QDir(strPath).removeRecursively();
+        }
+        return QFile::remove(strPath);
+    },
+    [socketGuard, strPath](bool ret)
+    {
+        // 回调已经回到 socket 所属线程；连接断了就没人等这个应答了
+        if (socketGuard.isNull())
+        {
+            return;
+        }
+        qDebug() << "delDir 异步完成 ret:" << ret << strPath;
+        socketGuard->sendMsg(makeBoolPdu(ENUM_TYPE_DEL_DIR_RESPOND, ret));
+    });
+
+    return NULL;    // 应答在删除执行完之后异步发出
 }
 
 PDU *MsgHandler::renameFile()
@@ -720,33 +744,56 @@ PDU *MsgHandler::shareFile()
         strDstPath = QString("%1/%2(%3)%4").arg(strTarDir).arg(fi.completeBaseName()).arg(i).arg(strSuffix);
     }
 
-    bool ret = QFile::copy(strSrcPath, strDstPath);
-    if (!ret)
-    {
-        qWarning() << "分享复制失败:" << strSrcPath << "->" << strDstPath;
-        return makeBoolRespond(ENUM_TYPE_SHARE_FILE_RESPOND, false);
-    }
-
-    // 通知接收方。用 CHAT_RESEND 而不是新加一个类型：客户端本来就会把它
-    // 显示在对应会话窗口里，接收方在线就即时看到，离线则走离线消息补发。
+    // 拷贝同样是一个与网络无关、耗时随文件大小线性增长的操作，和递归删除一样
+    // 下沉到线程池。回调的 context 用常驻的 MyTcpServer 而不是发起方的 socket：
+    // 发起方中途断线时拷贝已经做完了，接收方仍然应该收到那条通知。
     const QString strNotice = QString("[系统] %1 向您分享了文件 %2，已存入您的网盘")
                                   .arg(m_loginName)
                                   .arg(QFileInfo(strDstPath).fileName());
-    const QByteArray noticeBytes = strNotice.toUtf8();
-    const QByteArray senderBytes = m_loginName.toUtf8();
-    const QByteArray targetBytes = strTarName.toUtf8();
+    const QString strSenderName = m_loginName;
+    const QByteArray baTarName(caTarName, int(qstrnlen(caTarName, 32)));
+    const QPointer<MyTcpSocket> socketGuard = m_pSocket;
+    const QPointer<QObject> serverGuard(&MyTcpServer::getInstance());
 
-    PDU* noticePdu = mkPDU(noticeBytes.size());
-    noticePdu->uiType = ENUM_TYPE_CHAT_RESEND;
-    memcpy(noticePdu->caData, senderBytes.constData(), size_t(qMin(32, senderBytes.size())));
-    memcpy(noticePdu->caData + 32, targetBytes.constData(), size_t(qMin(32, targetBytes.size())));
-    memcpy(noticePdu->caMsg, noticeBytes.constData(), size_t(noticeBytes.size()));
-
-    if (!MyTcpServer::getInstance().resend(caTarName, noticePdu))
+    FileTask::runAsync(serverGuard,
+                       [strSrcPath, strDstPath]()
     {
-        operateDB::getInstance().handleSaveOfflineMsg(m_loginName, strTarName, strNotice);
-    }
-    free(noticePdu);
+        return QFile::copy(strSrcPath, strDstPath);
+    },
+    [socketGuard, strSrcPath, strDstPath, strNotice, strSenderName, strTarName, baTarName](bool ret)
+    {
+        if (!ret)
+        {
+            qWarning() << "分享复制失败:" << strSrcPath << "->" << strDstPath;
+            if (!socketGuard.isNull())
+            {
+                socketGuard->sendMsg(makeBoolPdu(ENUM_TYPE_SHARE_FILE_RESPOND, false));
+            }
+            return;
+        }
 
-    return makeBoolRespond(ENUM_TYPE_SHARE_FILE_RESPOND, true);
+        // 通知接收方。用 CHAT_RESEND 而不是新加一个类型：客户端本来就会把它
+        // 显示在对应会话窗口里，接收方在线就即时看到，离线则走离线消息补发。
+        const QByteArray noticeBytes = strNotice.toUtf8();
+        const QByteArray senderBytes = strSenderName.toUtf8();
+
+        PDU* noticePdu = mkPDU(noticeBytes.size());
+        noticePdu->uiType = ENUM_TYPE_CHAT_RESEND;
+        memcpy(noticePdu->caData, senderBytes.constData(), size_t(qMin(32, senderBytes.size())));
+        memcpy(noticePdu->caData + 32, baTarName.constData(), size_t(qMin(32, baTarName.size())));
+        memcpy(noticePdu->caMsg, noticeBytes.constData(), size_t(noticeBytes.size()));
+
+        if (!MyTcpServer::getInstance().resend(baTarName.constData(), noticePdu))
+        {
+            operateDB::getInstance().handleSaveOfflineMsg(strSenderName, strTarName, strNotice);
+        }
+        free(noticePdu);
+
+        if (!socketGuard.isNull())
+        {
+            socketGuard->sendMsg(makeBoolPdu(ENUM_TYPE_SHARE_FILE_RESPOND, true));
+        }
+    });
+
+    return NULL;    // 应答在拷贝执行完之后异步发出
 }

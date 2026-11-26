@@ -5,10 +5,12 @@
 
 #include <QByteArray>
 #include <QCryptographicHash>
+#include <QPointer>
 #include <QString>
 #include <memory>
 
 class QFile;
+class MyTcpSocket;
 
 
 
@@ -25,6 +27,12 @@ public:
     PDU* pdu;
     // 当前连接已登录的用户名，由 MyTcpSocket::handleMsg 每次分发前同步
     QString m_loginName;
+
+    // 记住拥有本处理器的连接。递归删除、跨用户拷贝这类慢操作交给线程池后，
+    // 结果必须排队回到该连接所属的线程才能写 socket（QTcpSocket 有线程亲和性）。
+    // 用 QPointer 是因为连接可能在这期间被断开销毁。
+    void setSocket(MyTcpSocket* pSocket) { m_pSocket = pSocket; }
+    QPointer<MyTcpSocket> socket() const { return m_pSocket; }
 
     PDU*regist();
     PDU* findUser();
@@ -62,6 +70,9 @@ private:
                              PDU** outRespond) const;
     // 构造一个只带 bool 结果的应答包
     PDU* makeBoolRespond(ENUM_TYPE type, bool ret) const;
+
+    // ---- 慢操作下沉线程池时需要的东西 ----
+    QPointer<MyTcpSocket> m_pSocket;
 
     // 身份绑定校验：caData 前 32 字节里的"当前用户"必须与会话登录名一致，
     // 不一致说明客户端在冒充别人，直接拒绝。

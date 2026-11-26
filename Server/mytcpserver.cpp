@@ -42,7 +42,7 @@ void MyTcpServer::removeSocket(MyTcpSocket *mySocket)
     mySocket=NULL;
 }
 
-bool MyTcpServer::resend(char *caTarName, PDU *pdu)
+bool MyTcpServer::resend(const char *caTarName, PDU *pdu)
 {
     if(caTarName==NULL||pdu==NULL)
     {

@@ -52,8 +52,11 @@ int main(int argc, char *argv[])
 
     QApplication a(argc, argv);
     operateDB::getInstance().connectSQL();
-    Server w;
-    //w.show();
+    // 必须用单例，不能在栈上再构造一个 Server：MsgHandler 计算用户网盘根路径时
+    // 走的是 Server::getInstance()，两个实例会导致第二次 listen() 失败，日志里
+    // 每次都会多出一条误导性的"监听失败"警告。
+    Server::getInstance();
+    //Server::getInstance().show();
 
     return a.exec();
 }
