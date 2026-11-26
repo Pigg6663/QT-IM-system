@@ -142,15 +142,20 @@ void ResHandler::delFriend()
 
 void ResHandler::chat()
 {
-    Chat* c = Index::getInstance().getFriend()->m_pChat;
-        if (c->isHidden()) {
-            c->show();
-        }
+    // caData = [发送者, 接收者]，取前半段作为会话对象
+    char caSender[32] = {'\0'};
+    memcpy(caSender, pdu->caData, 32);
+    const QString strSender = QString::fromUtf8(caSender);
 
-        char caChatName[32] = {'\0'};
-        memcpy(caChatName, pdu->caData, 32);
-        c->updateShow_TE(QString("%1 : %2").arg(caChatName).arg(pdu->caMsg));
-        c->m_strChatName = caChatName;
+    // 按发送者取对应窗口，而不是复用同一个全局窗口：
+    // 原来会在每次收到消息时把 m_strChatName 改成发送者，
+    // 导致 A、B 的消息混在一个窗口里，回复还可能发错人。
+    Chat* pChat = Index::getInstance().getFriend()->appendIncoming(
+                strSender,
+                QString("%1 : %2").arg(strSender).arg(QString::fromUtf8(pdu->caMsg)));
+    if (!pChat) {
+        qDebug() << "chat: 发送者名为空，无法定位会话窗口";
+    }
 }
 
 void ResHandler::mkdir()

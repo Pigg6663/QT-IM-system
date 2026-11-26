@@ -6,6 +6,7 @@
 
 #include <QInputDialog>
 #include <QMessageBox>
+#include <QtAlgorithms>
 
 Friend::Friend(QWidget *parent) :
     QWidget(parent),
@@ -13,14 +14,46 @@ Friend::Friend(QWidget *parent) :
 {
     ui->setupUi(this);
     m_pOnlineUser=new OnlineUser;
-    m_pChat= new Chat;
 }
 
 Friend::~Friend()
 {
+    // 聊天窗口是独立顶层窗口（无父对象），必须显式释放
+    qDeleteAll(m_chatMap);
+    m_chatMap.clear();
     delete ui;
     delete m_pOnlineUser;
-    delete m_pChat;
+}
+
+Chat* Friend::openChat(const QString& strPeerName)
+{
+    if (strPeerName.isEmpty()) {
+        return nullptr;
+    }
+    Chat* pChat = m_chatMap.value(strPeerName, nullptr);
+    if (!pChat) {
+        pChat = new Chat;
+        // 只在创建时设定一次会话对象，之后不再被其它会话覆盖
+        pChat->m_strChatName = strPeerName;
+        pChat->setWindowTitle(QString("与 %1 聊天").arg(strPeerName));
+        m_chatMap.insert(strPeerName, pChat);
+    }
+    return pChat;
+}
+
+Chat* Friend::appendIncoming(const QString& strPeerName, const QString& strContent)
+{
+    Chat* pChat = openChat(strPeerName);
+    if (!pChat) {
+        return nullptr;
+    }
+    pChat->updateShow_TE(strContent);
+    if (pChat->isHidden()) {
+        pChat->show();
+    }
+    pChat->raise();
+    pChat->activateWindow();
+    return pChat;
 }
 
 void Friend::on_findUser_clicked()
@@ -92,12 +125,16 @@ void Friend::on_del_PB_clicked()
 void Friend::on_chat_PB_clicked()
 {
     QListWidgetItem* pItem = ui->listWidget->currentItem();
-        if (!pItem) {
-            return;
-        }
+    if (!pItem) {
+        return;
+    }
 
-        if (m_pChat->isHidden()) {
-            m_pChat->show();
-        }
-        m_pChat->m_strChatName = pItem->text();
+    // 每个好友一个独立窗口：重复点击只是把已存在的窗口提到前面
+    Chat* pChat = openChat(pItem->text());
+    if (!pChat) {
+        return;
+    }
+    pChat->show();
+    pChat->raise();
+    pChat->activateWindow();
 }
