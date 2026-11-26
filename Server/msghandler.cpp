@@ -484,15 +484,22 @@ PDU *MsgHandler::uploadFile()
     memcpy(&llTotal, pdu->caData + UPLOAD_SIZE_POS, sizeof(qint64));
     const QByteArray md5Raw(pdu->caData + UPLOAD_MD5_POS, MD5_RAW_LEN);
 
+    // 文件名是定长 32 字节字段，可能刚好没有 '\0'：按限长构造，别当 C 串用
+    const QString strFileName = QString::fromUtf8(caFileName, int(qstrnlen(caFileName, 32)));
     const QString strDir  = QString::fromUtf8(pdu->caMsg);
-    const QString strPath = QString("%1/%2").arg(strDir).arg(caFileName);
+    const QString strPath = QString("%1/%2").arg(strDir).arg(strFileName);
     qDebug() << "uploadFile(init) path:" << strPath << "size:" << llTotal;
 
     PDU* errRespond = NULL;
     // caMsg 只有目录路径，文件名在 caData，两段都要卡在用户根目录内
-    if (!isSafePathOrRespond(strDir, ENUM_TYPE_UPLOAD_FILE_RESPOND, &errRespond)
+    if (strFileName.isEmpty()
+        || !isSafePathOrRespond(strDir, ENUM_TYPE_UPLOAD_FILE_RESPOND, &errRespond)
         || !isSafePathOrRespond(strPath, ENUM_TYPE_UPLOAD_FILE_RESPOND, &errRespond))
     {
+        if (errRespond == NULL)
+        {
+            return makeBoolRespond(ENUM_TYPE_UPLOAD_FILE_RESPOND, false);
+        }
         return errRespond;
     }
 
@@ -651,8 +658,9 @@ PDU *MsgHandler::downloadFile()
 {
     char caFileName[32] = {'\0'};
     memcpy(caFileName, pdu->caData, 32);
+    const QString strFileName = QString::fromUtf8(caFileName, int(qstrnlen(caFileName, 32)));
     const QString strDir  = QString::fromUtf8(pdu->caMsg);
-    const QString strPath = QString("%1/%2").arg(strDir).arg(caFileName);
+    const QString strPath = QString("%1/%2").arg(strDir).arg(strFileName);
     qint64 llResume = 0;
     memcpy(&llResume, pdu->caData + DL_RESUME_POS, sizeof(qint64));
     qDebug() << "downloadFile(init) path:" << strPath << "客户端已有:" << llResume;
@@ -710,15 +718,21 @@ PDU *MsgHandler::shareFile()
     memcpy(caFileName, pdu->caData, 32);
     memcpy(caTarName, pdu->caData + 32, 32);
     const QString strDir = QString::fromUtf8(pdu->caMsg);
-    const QString strSrcPath = QString("%1/%2").arg(strDir).arg(caFileName);
+    const QString strFileName = QString::fromUtf8(caFileName, int(qstrnlen(caFileName, 32)));
+    const QString strSrcPath = QString("%1/%2").arg(strDir).arg(strFileName);
     const QString strTarName = QString::fromUtf8(caTarName, int(qstrnlen(caTarName, 32)));
     qDebug() << "shareFile" << strSrcPath << "to user:" << strTarName;
 
     PDU* errRespond = NULL;
     // 只允许分享自己网盘目录内的文件
-    if (!isSafePathOrRespond(strDir, ENUM_TYPE_SHARE_FILE_RESPOND, &errRespond)
+    if (strFileName.isEmpty()
+        || !isSafePathOrRespond(strDir, ENUM_TYPE_SHARE_FILE_RESPOND, &errRespond)
         || !isSafePathOrRespond(strSrcPath, ENUM_TYPE_SHARE_FILE_RESPOND, &errRespond))
     {
+        if (errRespond == NULL)
+        {
+            return makeBoolRespond(ENUM_TYPE_SHARE_FILE_RESPOND, false);
+        }
         return errRespond;
     }
 
