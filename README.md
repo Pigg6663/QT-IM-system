@@ -396,7 +396,7 @@ powershell -ExecutionPolicy Bypass -File tests\test_security.ps1
 | 5 | 口令明文存储 | ✅ 已修复 | 每用户 16 字节随机盐 + SHA-256；历史明文登录时惰性升级 |
 | 6 | SQL 全部为字符串拼接（注入风险） | ✅ 已修复 | 全量改 `QSqlQuery::prepare()` + `bindValue()`（12 处 prepare / 19 处 bind） |
 | 7 | 大文件整包读入内存 | ✅ 已修复 | 256 KB 固定分片 + 偏移序号 + 整文件 MD5 校验 + `.part` 断点续传；下行由服务端按 `bytesWritten` 反压主动推送 |
-| 8 | 无离线消息，对方离线即丢弃 | ✅ 已修复 | 对方不在线时消息落 `message` 表；登录应答后排队补发（每批上限 200 条），补发即标记已读 |
+| 8 | 无离线消息，对方离线即丢弃 | ✅ 已修复 | 对方不在线时消息落 `message` 表；登录应答后分批补发（每批 200，循环取空），写进 socket 之后才标记已读 |
 | 9 | 服务端单线程处理，慢操作阻塞全部连接 | ✅ 已修复 | 递归删除、分享拷贝下沉 `QThreadPool`，完成后排队回 socket 线程；连接层与 DB 仍留主线程（两者都有线程亲和性） |
 | 10 | 聊天窗口全局复用，跨会话串消息、可能回复错人 | ✅ 已修复 | 按好友维度维护 `QMap<QString, Chat*>`，窗口的会话对象只在创建时赋值一次 |
 | 11 | 重复登录踢人后，账号被错误置为离线 | ✅ 已修复 | 断线时先判定是否还有同名有效连接，有则保持 `online = 1` |
@@ -654,12 +654,13 @@ QMetaObject::invokeMethod(this, [guard]() {
 
 | 常量 | 值 | 作用 |
 |---|---|---|
-| `kMaxOfflineBatch` | 200 | 单次登录最多补发条数，避免积压上万条时登录瞬间灌满 socket 缓冲 |
+| `kMaxOfflineBatch` | 200 | **每批**补发条数；循环取空为止，写缓冲超过 4MB 时剩余部分留待下次登录（`is_read` 仍是 0） |
 | `kMaxOfflineContentBytes` | 60000 | `content` 是 `TEXT`（65535 字节），超长直接拒绝入库，否则整条 insert 失败、消息静默丢失 |
 
 **投递语义：宁可重复，不可丢失。**
-实现是"先查出未读 → 逐条下发 → 再批量标记已读"。
-若在"下发完"与"标记已读"之间进程崩溃，这一批会重复投递一次。
+实现是"取一批未读 → 逐条写进 socket → 这一批全部写下去之后再批量标记已读"，然后接着取下一批，直到取空
+（`pushOfflineMessages()` 里的 `while`；写缓冲超过 4MB 就先停下，剩下的下次登录继续补）。
+若在"写完"与"标记已读"之间进程崩溃，这一批会重复投递一次；若在标记之前连接就断了，这一批不标记，留给下次登录。
 要严格一次投递，需要客户端回 ACK + 服务端按消息 id 去重，那要改协议，本版本没做。
 
 **客户端**：收到 `OFFLINE_MSG_RESEND` 后走 `ResHandler::offlineMsg()`，
@@ -668,6 +669,7 @@ QMetaObject::invokeMethod(this, [guard]() {
 
 验证见 `tests/test_offline.ps1`（17 / 17）：落库、补发顺序、补发后已读、重新登录不重发、
 双方在线直投不落库、冒名发送被丢弃。
+另外单独灌 250 条未读做过压测：一次登录分两批（200 + 50）补完、顺序正确、补完未读归零，第二次登录不再补发。
 
 ### 9.8 多会话聊天窗口（第 10 项）
 
@@ -922,6 +924,20 @@ $env:IM_SERVER_LOG = "D:\QTdm\build-console\Server\dbg.log"
 - 未做 TLS，协议为明文传输，仅适用于内网 / 本机演示场景；
 - `caData` 里的身份是"客户端自称 + 服务端校验"，仍依赖两端字段约定一致；
   更彻底的做法是身份只由会话决定、协议里根本不传"我是谁"，但那需要改客户端与协议格式。
+
+### 9.13 复查补丁（第 7~10 项落地后又修掉的四处）
+
+四项功能上线后做了一轮通读复查，又找出四处"功能能跑、但边界没兜住"的问题：
+
+| 位置 | 问题 | 修法 |
+|---|---|---|
+| `msghandler.cpp` `uploadFile` / `downloadFile` / `shareFile` | `char caFileName[32]` 从 `caData` 拷满 32 字节后直接当 C 串用；文件名**恰好 32 字节**时没有 `'\0'`，构造路径会读越界 | 统一 `QString::fromUtf8(caFileName, int(qstrnlen(caFileName, 32)))`，与同文件 `caTarName` 的写法对齐；文件名解析为空时直接回失败应答 |
+| `operatedb.cpp` `handleTakeOfflineMsgs` | 名字叫"取出"，实现里**取出前**就 `update ... is_read=1`。与 9.7 写的"下发完再标记"相反：连接在推送前断掉，这批消息就永久丢了 | 拆成 `handlePickOfflineMsgs()`（只读）+ `handleMarkOfflineMsgsRead()`（写），由 `pushOfflineMessages()` 在写进 socket 之后调用；标记失败立即停手，否则下一轮又会取到同一批，变成死循环 |
+| `mytcpsocket.cpp` `pushOfflineMessages` | 单次登录只补一批 200 条，未读超过 200 要重新登录才拿得到剩下的 | 改成 `while` 循环取空；写缓冲超过 4 MB 就先停，剩下的下次登录接着补 |
+| `mytcpsocket.cpp` `tryStartDownload` | 握手已经回过 `ok=true`，随后打开文件失败只 `qWarning` 就 return，客户端会一直等分片等到超时 | 补一条 `DOWNLOAD_FILE_FINISH_RESPOND`（`ok=false`），客户端走既有的校验失败分支，删掉本地半成品并提示 |
+
+回归：7 个脚本全部重跑（6 + 21 + 14 + 8 + 37 + 17 + 12 = **115 / 115**）；
+离线补发另做了 250 条的压测（两批补完、顺序正确、补完未读归零、二次登录不重发）。
 
 ---
 
