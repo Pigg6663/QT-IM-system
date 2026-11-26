@@ -58,14 +58,17 @@
 │   └── connect.config.txt      # 监听 IP / 端口（必须 CRLF 换行，编译进 qrc）
 │
 ├── sql/
-│   ├── init.sql                # 建库建表（含 salt 列、好友唯一约束）
-│   └── migrate_v2.sql          # 旧库升级脚本（加盐哈希 + 唯一约束 + 去重）
+│   ├── init.sql                # 建库建表（含 salt 列、好友唯一约束、离线消息表）
+│   ├── migrate_v2.sql          # 旧库升级脚本（加盐哈希 + 唯一约束 + 去重）
+│   └── migrate_v3.sql          # 旧库升级脚本（离线消息表）
 │
 └── tests/
     ├── build.ps1               # 一键构建两端，失败即中断
     ├── test_protocol.ps1       # 粘包 / 半包 / 非法包长
     ├── test_heartbeat.ps1      # 心跳 / 重复登录互踢 / 超时回收
-    └── test_security.ps1       # SQL 注入 / 口令哈希 / 路径越权
+    ├── test_security.ps1       # SQL 注入 / 口令哈希 / 路径越权
+    ├── test_auth.ps1           # 未登录拦截 / 冒名操作 / 互踢后 online 状态
+    └── test_offline.ps1        # 离线落库 / 登录补发顺序 / 已读不重发
 ```
 
 ---
@@ -251,7 +254,9 @@ fc /n Server\protocol.h Client\protocol.h
 **4. 聊天**
 A 发送 `CHAT_REQUEST`（caData：`A` | `B`，caMsg：消息内容）→ 服务端复制一份 PDU 并将类型改为 `CHAT_RESEND`，
 按目标用户登录名在连接列表中查找 socket 并转发 → B 的聊天窗口显示。
-（对方离线时消息直接丢弃，暂无离线消息存储。）
+
+对方不在线时不丢弃：消息写入 `message` 表（`is_read = 0`），等 B 下次登录成功后服务端排队补发
+（类型 `OFFLINE_MSG_RESEND`），补发完即标记已读。详见 9.7。
 
 **5. 网盘操作**
 客户端只发送「操作意图」（当前路径 + 文件名等），服务端先用 `isSafePath()` 校验路径落在用户根目录内，
@@ -383,9 +388,9 @@ powershell -ExecutionPolicy Bypass -File tests\test_security.ps1
 | 5 | 口令明文存储 | ✅ 已修复 | 每用户 16 字节随机盐 + SHA-256；历史明文登录时惰性升级 |
 | 6 | SQL 全部为字符串拼接（注入风险） | ✅ 已修复 | 全量改 `QSqlQuery::prepare()` + `bindValue()`（12 处 prepare / 19 处 bind） |
 | 7 | 大文件整包读入内存 | ⏳ 待办 | 计划改分片传输（固定分片 + 序号）+ 校验和 + 断点续传 |
-| 8 | 无离线消息，对方离线即丢弃 | ⏳ 待办 | 计划消息落库 + 登录后推送 |
+| 8 | 无离线消息，对方离线即丢弃 | ✅ 已修复 | 对方不在线时消息落 `message` 表；登录应答后排队补发（每批上限 200 条），补发即标记已读 |
 | 9 | 服务端单线程处理，慢操作阻塞全部连接 | ⏳ 待办 | 连接层留在主线程（`QTcpSocket` 有线程亲和性），业务投递线程池；`QSqlDatabase` 需每线程独立连接 |
-| 10 | 聊天窗口全局复用，跨会话串消息、可能回复错人 | ⏳ 待办 | 计划按好友维度维护 `QMap<QString, Chat*>` |
+| 10 | 聊天窗口全局复用，跨会话串消息、可能回复错人 | ✅ 已修复 | 按好友维度维护 `QMap<QString, Chat*>`，窗口的会话对象只在创建时赋值一次 |
 | 11 | 重复登录踢人后，账号被错误置为离线 | ✅ 已修复 | 断线时先判定是否还有同名有效连接，有则保持 `online = 1` |
 | 12 | 服务端不校验操作身份，可冒充他人 | ✅ 已修复 | 分发入口加登录态拦截 + `caData` 自称身份与会话登录名强校验 |
 
@@ -393,6 +398,9 @@ powershell -ExecutionPolicy Bypass -File tests\test_security.ps1
 所以"直接加线程池"是错的，正确顺序是先做连接管理（每线程独立连接 / 连接池），再线程化业务——这个取舍本身值得展开讲。
 
 第 11、12 项是后期复查中发现的两处缺陷，详见 9.6。
+第 8 项（离线消息）与第 10 项（多会话窗口）的完整实现思路见 9.7、9.8。
+剩余的第 7、9 项属于**架构级改造**（协议要重新设计 / 并发模型要换），
+不在本轮范围内，仍在待办中——这里如实标 ⏳，不把"知道怎么做"写成"已经做完"。
 
 ### 9.2 健壮性：收包状态机（第 1 项）
 
@@ -589,7 +597,99 @@ bool MsgHandler::isOwnIdentity(const char* caClaimedName) const
 > 例如 `FLUSH_FRIEND_RESPOND` 本身不承载 `bool`，拒绝时返回空列表，
 > 与"确实没有好友"在线上不可区分——这样既不泄漏信息，也不用改协议。
 
-### 9.7 测试脚本与验证方式
+### 9.7 离线消息（第 8 项）
+
+原实现里 `MyTcpServer::resend()` 找不到在线目标时只打印一行日志就把 PDU 丢掉，
+对方不在线期间的聊天消息彻底丢失。
+
+**落库时机**：`resend()` 返回 `bool`（命中在线连接 `true`，未命中 `false`），
+`MsgHandler::chat()` 只在 `false` 时才落库——在线投递成功不应该在数据库里再留一份。
+
+```cpp
+const bool delivered = MyTcpServer::getInstance().resend(tarName, resendPdu);
+free(resendPdu);
+if (!delivered)
+{
+    operateDB::getInstance().handleSaveOfflineMsg(strSender, strReceiver, strContent);
+}
+```
+
+**补发时机**：登录成功后立刻补发，但必须排在 `LOGIN_RESPOND` 之后。
+`recvMsg()` 里 `handleMsg()` 只**返回**应答包，真正写 socket 是在 `sendMsg()`；
+若在 LOGIN 分支里直接推送离线消息，它会先于登录应答到达客户端，
+客户端此刻还没跳转主界面，`Friend` 窗口尚未创建，消息就丢了。
+所以排队到下一轮事件循环：
+
+```cpp
+QPointer<MyTcpSocket> guard(this);
+QMetaObject::invokeMethod(this, [guard]() {
+    if (guard) { guard->pushOfflineMessages(); }
+}, Qt::QueuedConnection);
+```
+
+`QPointer` 是必需的：排队期间客户端可能已断开，lambda 执行时 `this` 已被 `deleteLater()` 释放。
+
+**数据模型**：`message(id, sender, receiver, content, is_read, created_at)`。
+`sender` / `receiver` 存**登录名**而不是 `user_info.id`——补发时按登录名直接查，省一次关联；
+本项目没有改名功能，不会失效。`KEY idx_receiver_read(receiver, is_read)` 覆盖"查某人未读"这个唯一的查询。
+
+**两个上限**：
+
+| 常量 | 值 | 作用 |
+|---|---|---|
+| `kMaxOfflineBatch` | 200 | 单次登录最多补发条数，避免积压上万条时登录瞬间灌满 socket 缓冲 |
+| `kMaxOfflineContentBytes` | 60000 | `content` 是 `TEXT`（65535 字节），超长直接拒绝入库，否则整条 insert 失败、消息静默丢失 |
+
+**投递语义：宁可重复，不可丢失。**
+实现是"先查出未读 → 逐条下发 → 再批量标记已读"。
+若在"下发完"与"标记已读"之间进程崩溃，这一批会重复投递一次。
+要严格一次投递，需要客户端回 ACK + 服务端按消息 id 去重，那要改协议，本版本没做。
+
+**客户端**：收到 `OFFLINE_MSG_RESEND` 后走 `ResHandler::offlineMsg()`，
+内容加 `[离线]` 前缀写进对应会话窗口。这里用 `appendIncoming(..., bPopUp = false)`
+**不弹窗**——刚登录就为每个发送者弹一个窗口太打扰，用户点开聊天记录自然能看到。
+
+验证见 `tests/test_offline.ps1`（17 / 17）：落库、补发顺序、补发后已读、重新登录不重发、
+双方在线直投不落库、冒名发送被丢弃。
+
+### 9.8 多会话聊天窗口（第 10 项）
+
+原实现 `Friend` 只持有**一个**全局 `Chat* m_pChat`，`reshandler.cpp::chat()` 每收到一条消息
+就把它当作当前会话：
+
+```cpp
+// 原写法：每次收到消息都覆盖全局会话对象
+m_pChat->m_strChatName = strSender;
+```
+
+后果：A 和 B 的消息混进同一个窗口，界面上的"聊天对象"被最后一次消息的发送者覆盖，
+回复会发给**最后说话的人**而不是窗口标题显示的人——多人聊天时会串消息、发错人。
+
+修复：按好友维度维护窗口表，会话对象只在**创建窗口时**赋值一次，之后不再被任何消息改写。
+
+```cpp
+QMap<QString, Chat*> m_chatMap;   // 好友名 -> 聊天窗口
+
+Chat* Friend::openChat(const QString& strPeerName)
+{
+    Chat* pChat = m_chatMap.value(strPeerName, nullptr);
+    if (!pChat) {
+        pChat = new Chat;
+        pChat->m_strChatName = strPeerName;                       // 只在这里赋值
+        pChat->setWindowTitle(QString("与 %1 聊天").arg(strPeerName));
+        m_chatMap.insert(strPeerName, pChat);
+    }
+    return pChat;
+}
+```
+
+`reshandler.cpp::chat()` 改为按 `caData[0:32]`（发送者）定位窗口后追加内容，
+不再触碰任何全局字段；析构时 `qDeleteAll(m_chatMap)`。
+
+代价：窗口数量随聊天过的好友数增长，一个好友一个窗口，没有做数量上限。
+对本项目（演示规模）可以接受，真要长期运行应加 LRU 关窗或改成单窗口多会话页签。
+
+### 9.9 测试脚本与验证方式
 
 `tests/` 下的脚本**手工构造 PDU 字节流**，不依赖 GUI，可直接复现上述修复：
 
@@ -600,11 +700,12 @@ bool MsgHandler::isOwnIdentity(const char* caClaimedName) const
 | `tests/test_heartbeat.ps1` | 心跳应答、重复登录互踢、异常掉线 35s 超时回收 | 8 / 8 通过 |
 | `tests/test_security.ps1` | SQL 注入被拒、口令哈希格式、错误口令、路径越权（列目录 / mkdir，并验证未落盘）、合法路径回归、历史明文自动升级 | 14 / 14 通过 |
 | `tests/test_auth.ps1` | 未登录调用业务接口被拒、冒名聊天 / 加好友 / 删好友 / 查好友列表被拒、合法操作未误杀；互踢后 `online` 仍为 1、唯一连接断开后归 0 | 18 / 18 通过 |
+| `tests/test_offline.ps1` | 离线落库、登录补发顺序（`LOGIN_RESPOND` 在前）、补发后已读、重新登录不重发、在线直投不落库、冒名发送被拒 | 17 / 17 通过 |
 
 > `test_protocol.ps1` 的用例需要**先登录**才能触发业务应答（服务端已加登录态校验），
 > 脚本里封装了 `New-AuthenticatedClient`。
 
-### 9.8 已知取舍（暂不处理）
+### 9.10 已知取舍（暂不处理）
 
 - 未引入单元测试框架，验证方式为协议级脚本 + 双客户端手动联调；
 - 服务端无界面，运行日志依赖 `qDebug()` 输出；
@@ -633,6 +734,9 @@ bool MsgHandler::isOwnIdentity(const char* caClaimedName) const
 | 口令安全 | 每用户随机盐 + SHA-256，不存明文；旧数据登录时惰性升级 |
 | 路径安全 | `QDir::cleanPath` 消解 `..` 后与用户根目录做前缀比较（带分隔符，避免 `/alice2` 命中 `/alice`） |
 | 协议双端一致性 | 两份 `protocol.h` 必须逐字节一致（见 5.1），枚举只能追加不能插队 |
+| 离线消息 / 投递语义 | 对方不在线时落 `message` 表，登录后排队补发；"先查未读 → 下发 → 标记已读"的 at-least-once 取舍 |
+| 客户端多会话 | `QMap<QString, Chat*>` 按好友维度维护窗口，会话对象只在创建时赋值，避免串消息 |
+| 弱指针防悬空 | `QPointer<MyTcpSocket>` + `Qt::QueuedConnection` 排队回调，跨事件循环访问已析构对象时自动判空 |
 
 ---
 

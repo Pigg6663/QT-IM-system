@@ -50,6 +50,27 @@ CREATE TABLE IF NOT EXISTS `friend` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ------------------------------------------------------------
+-- 离线消息表
+-- 对方不在线时聊天消息先落到这里，等其登录成功后由服务端补发。
+--
+-- sender / receiver 存登录名（不是 user_info.id）：
+-- 补发时按登录名直接查，省一次关联；代价是改名需要同步维护，
+-- 本项目没有改名功能，所以这个取舍是划算的。
+-- is_read：0 = 未投递，1 = 已补发（或已在线投递）。
+-- idx_receiver_read 覆盖 "查某人的未读消息" 这个唯一的高频查询。
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `message` (
+    `id`         BIGINT       NOT NULL AUTO_INCREMENT,
+    `sender`     VARCHAR(32)  NOT NULL,
+    `receiver`   VARCHAR(32)  NOT NULL,
+    `content`    TEXT         NOT NULL,
+    `is_read`    TINYINT(1)   NOT NULL DEFAULT 0,
+    `created_at` DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    KEY `idx_receiver_read` (`receiver`, `is_read`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ------------------------------------------------------------
 -- 说明：不预置示例账号。
 -- 口令必须经过服务端的加盐哈希流程，直接 INSERT 明文也能登录
 -- （服务端对 salt 为空的旧记录会按明文比对并自动升级），

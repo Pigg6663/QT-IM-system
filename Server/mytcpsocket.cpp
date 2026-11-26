@@ -135,6 +135,17 @@ PDU *MyTcpSocket::handleMsg(PDU *pdu)
       if (ok)
       {
           MyTcpServer::getInstance().kickDuplicate(m_strLoginName, this);
+
+          // 离线消息必须排在"登录成功应答"之后下发。
+          // 此刻应答还没发出去（它在 recvMsg 里 sendMsg），所以排队到下一轮事件循环，
+          // 保证客户端先收到 LOGIN_RESPOND 完成跳转、再收到补发的消息。
+          QPointer<MyTcpSocket> guard(this);
+          QMetaObject::invokeMethod(this, [guard]() {
+              if (guard)
+              {
+                  guard->pushOfflineMessages();
+              }
+          }, Qt::QueuedConnection);
       }
       break;
     }
@@ -228,4 +239,38 @@ PDU *MyTcpSocket::handleMsg(PDU *pdu)
     free(pdu);
     pdu=NULL;
     return respdu;
+}
+
+void MyTcpSocket::pushOfflineMessages()
+{
+    if (m_strLoginName.isEmpty())
+    {
+        return;
+    }
+
+    const QList<operateDB::OfflineMsg> msgs =
+            operateDB::getInstance().handleTakeOfflineMsgs(m_strLoginName);
+    if (msgs.isEmpty())
+    {
+        return;
+    }
+
+    const QByteArray me = m_strLoginName.toUtf8();
+    for (const operateDB::OfflineMsg& msg : msgs)
+    {
+        const QByteArray content = msg.strContent.toUtf8();
+        const QByteArray sender  = msg.strSender.toUtf8();
+
+        PDU* pdu = mkPDU(uint(content.size()));
+        pdu->uiType = ENUM_TYPE_OFFLINE_MSG_RESEND;
+        // caData 两个定长槽位，按实际长度拷贝，剩余部分由 mkPDU 归零
+        memcpy(pdu->caData, sender.constData(), size_t(qMin(sender.size(), 32)));
+        memcpy(pdu->caData + 32, me.constData(), size_t(qMin(me.size(), 32)));
+        memcpy(pdu->caMsg, content.constData(), size_t(content.size()));
+
+        this->write((char*)pdu, pdu->uiTotalLen);
+        free(pdu);
+    }
+
+    qDebug() << "已补发离线消息" << msgs.size() << "条 ->" << m_strLoginName;
 }

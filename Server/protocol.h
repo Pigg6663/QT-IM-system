@@ -46,6 +46,9 @@ enum ENUM_TYPE{
     ENUM_TYPE_HEARTBEAT_REQUEST,
     ENUM_TYPE_HEARTBEAT_RESPOND,
     ENUM_TYPE_KICKED_RESEND,
+    // 离线消息补发：客户端登录成功后，服务端把落库的未读消息逐条推下来
+    // caData = [发送者, 接收者]，caMsg = 消息内容
+    ENUM_TYPE_OFFLINE_MSG_RESEND,
     ENUM_TYPE_MAX=99999,
 };
 

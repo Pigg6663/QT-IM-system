@@ -13,6 +13,13 @@ inline QString toStr(const char* p)
 {
     return QString::fromUtf8(p);
 }
+
+// 单次补发的离线消息条数上限：
+// 避免某个用户积压上万条时，登录瞬间把整批数据塞进 socket 缓冲区。
+constexpr int kMaxOfflineBatch = 200;
+// message.content 列是 TEXT（上限 65535 字节），入库前先挡掉超长消息，
+// 否则 MySQL 会整个 insert 失败、消息静默丢失，且错误日志被刷。
+constexpr int kMaxOfflineContentBytes = 60000;
 }
 
 operateDB &operateDB::getInstance()
@@ -338,6 +345,96 @@ bool operateDB::handleDelFriend(const char *caCurName, const char *caTarName)
         qDebug()<<"删除好友失败"<<q.lastError().text();
     }
     return ok;
+}
+
+// ---------------------------------------------------------------
+// 离线消息：对方不在线时先落库，等其登录后再补发。
+// 只保证"不丢"，不保证严格一次投递：先查出未读、推送成功后才标记已读，
+// 万一服务端在两者之间崩溃，用户会重复收到一条（可接受，优于丢消息）。
+// ---------------------------------------------------------------
+bool operateDB::handleSaveOfflineMsg(const QString& strSender,
+                                     const QString& strReceiver,
+                                     const QString& strContent)
+{
+    if (strSender.isEmpty() || strReceiver.isEmpty())
+    {
+        return false;
+    }
+    if (strContent.toUtf8().size() > kMaxOfflineContentBytes)
+    {
+        qDebug() << "离线消息超长，拒绝入库 长度" << strContent.toUtf8().size();
+        return false;
+    }
+
+    QSqlQuery q;
+    q.prepare("insert into `message`(`sender`, `receiver`, `content`) "
+              "values(:sender, :receiver, :content)");
+    q.bindValue(":sender",   strSender);
+    q.bindValue(":receiver", strReceiver);
+    q.bindValue(":content",  strContent);
+    if (!q.exec())
+    {
+        qDebug() << "离线消息入库失败" << q.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+QList<operateDB::OfflineMsg> operateDB::handleTakeOfflineMsgs(const QString& strReceiver)
+{
+    QList<OfflineMsg> res;
+    if (strReceiver.isEmpty())
+    {
+        return res;
+    }
+
+    QSqlQuery q;
+    // limit 直接写常量：部分 MySQL 驱动对绑定到 LIMIT 的参数支持不一致
+    q.prepare(QString("select `id`, `sender`, `content` from `message` "
+                      "where `receiver` = :receiver and `is_read` = 0 "
+                      "order by `id` asc limit %1").arg(kMaxOfflineBatch));
+    q.bindValue(":receiver", strReceiver);
+    if (!q.exec())
+    {
+        qDebug() << "查询离线消息失败" << q.lastError().text();
+        return res;
+    }
+
+    QList<qint64> ids;
+    while (q.next())
+    {
+        OfflineMsg msg;
+        ids.append(q.value(0).toLongLong());
+        msg.strSender  = q.value(1).toString();
+        msg.strContent = q.value(2).toString();
+        res.append(msg);
+    }
+
+    if (ids.isEmpty())
+    {
+        return res;
+    }
+
+    // 批量标记已读：占位符全部由代码生成，不拼用户数据
+    QStringList placeholders;
+    for (int i = 0; i < ids.size(); ++i)
+    {
+        placeholders << QString(":id%1").arg(i);
+    }
+    QSqlQuery up;
+    up.prepare(QString("update `message` set `is_read` = 1 where `id` in (%1)")
+               .arg(placeholders.join(",")));
+    for (int i = 0; i < ids.size(); ++i)
+    {
+        up.bindValue(placeholders[i], ids[i]);
+    }
+    if (!up.exec())
+    {
+        qDebug() << "标记离线消息已读失败" << up.lastError().text();
+    }
+
+    qDebug() << "取出离线消息" << res.size() << "条 用户" << strReceiver;
+    return res;
 }
 
 operateDB::operateDB(QObject *parent) : QObject(parent)

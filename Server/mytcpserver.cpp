@@ -42,11 +42,11 @@ void MyTcpServer::removeSocket(MyTcpSocket *mySocket)
     mySocket=NULL;
 }
 
-void MyTcpServer::resend(char *caTarName, PDU *pdu)
+bool MyTcpServer::resend(char *caTarName, PDU *pdu)
 {
     if(caTarName==NULL||pdu==NULL)
     {
-        return ;
+        return false;
     }
     // 按 32 字节定长字段显式构造 QByteArray：
     // 1) caData 里的用户名字段不保证以 '\0' 结尾（用户名恰好 32 字节时没有终止符），
@@ -69,10 +69,12 @@ void MyTcpServer::resend(char *caTarName, PDU *pdu)
                     <<"uiTotalLen"<<pdu->uiTotalLen
                     <<"uiMsgLen"<<pdu->uiMsgLen
                     <<"uiType"<<pdu->uiType;
-            return;
+            return true;
         }
     }
-    qDebug()<<"resend 未找到在线目标用户:"<<caTarName<<"，消息丢弃（无离线消息存储）";
+    // 返回 false 让调用方决定是否落库（离线消息），而不是在这里静默丢弃
+    qDebug()<<"resend 未找到在线目标用户:"<<caTarName<<"，交由调用方处理";
+    return false;
 }
 
 MyTcpSocket* MyTcpServer::findByLoginName(const QString& name)

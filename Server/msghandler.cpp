@@ -296,8 +296,20 @@ PDU *MsgHandler::chat()
     // 转发独立拷贝，避免原 pdu 被 handleMsg 释放后接收方读到已释放内存
     PDU* resendPdu = clonePdu(pdu);
     resendPdu->uiType = ENUM_TYPE_CHAT_RESEND;
-    MyTcpServer::getInstance().resend(tarName, resendPdu);
+    const bool delivered = MyTcpServer::getInstance().resend(tarName, resendPdu);
     free(resendPdu);
+
+    if (!delivered)
+    {
+        // 对方不在线：落库，等其登录后由 MyTcpSocket::pushOfflineMessages 补发。
+        // 名字字段可能不带终止符，按 32 字节上限取长度。
+        const QString strSender   = QString::fromUtf8(caCurName, int(qstrnlen(caCurName, 32)));
+        const QString strReceiver = QString::fromUtf8(tarName,   int(qstrnlen(tarName, 32)));
+        const QString strContent  = QString::fromUtf8(pdu->caMsg);
+        const bool saved = operateDB::getInstance().handleSaveOfflineMsg(strSender, strReceiver, strContent);
+        qDebug() << "聊天转发失败，离线落库" << saved
+                 << strSender << "->" << strReceiver;
+    }
     return NULL;
 }
 

@@ -21,6 +21,7 @@ public:
     void flushFriend();
     void delFriend();
     void chat();
+    void offlineMsg();
     void mkdir();
     void flushFile();
     void delDir();

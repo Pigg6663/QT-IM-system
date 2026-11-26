@@ -25,8 +25,11 @@ public:
     // 窗口自己的 m_strChatName 只在该会话创建时赋值一次，不再被全局覆盖，
     // 因此回复不会发错人。
     Chat* openChat(const QString& strPeerName);
-    // 收到消息（在线或离线补发）时调用：取窗口、追加内容、显示
-    Chat* appendIncoming(const QString& strPeerName, const QString& strContent);
+    // 收到消息时调用：取窗口、追加内容。
+    // bPopUp=false 用于登录后补发的离线消息——刚登录就弹一堆窗口太打扰，
+    // 只把内容追加进对应会话，用户点开才看得到。
+    Chat* appendIncoming(const QString& strPeerName, const QString& strContent,
+                         bool bPopUp = true);
 
     void flushFriend();
     void update_LW(QStringList friendList);

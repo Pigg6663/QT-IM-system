@@ -41,13 +41,17 @@ Chat* Friend::openChat(const QString& strPeerName)
     return pChat;
 }
 
-Chat* Friend::appendIncoming(const QString& strPeerName, const QString& strContent)
+Chat* Friend::appendIncoming(const QString& strPeerName, const QString& strContent,
+                             bool bPopUp)
 {
     Chat* pChat = openChat(strPeerName);
     if (!pChat) {
         return nullptr;
     }
     pChat->updateShow_TE(strContent);
+    if (!bPopUp) {
+        return pChat;
+    }
     if (pChat->isHidden()) {
         pChat->show();
     }

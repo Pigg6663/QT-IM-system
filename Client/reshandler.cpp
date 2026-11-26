@@ -158,6 +158,30 @@ void ResHandler::chat()
     }
 }
 
+void ResHandler::offlineMsg()
+{
+    // 服务端在登录成功后补发积压的离线消息：
+    // caData = [发送者, 接收者]，caMsg = 消息内容
+    char caSender[32] = {'\0'};
+    memcpy(caSender, pdu->caData, 32);
+    const QString strSender = QString::fromUtf8(caSender);
+    if (strSender.isEmpty()) {
+        qDebug() << "offlineMsg: 发送者为空，丢弃";
+        return;
+    }
+
+    // 不弹窗：刚登录就为每个发送者弹一个窗口太打扰，
+    // 只把内容写进对应会话，用户点开聊天窗口即可看到。
+    const QString strContent = QString::fromUtf8(pdu->caMsg);
+    Chat* pChat = Index::getInstance().getFriend()->appendIncoming(
+                strSender,
+                QString("[离线] %1 : %2").arg(strSender).arg(strContent),
+                false);
+    if (!pChat) {
+        qDebug() << "offlineMsg: 无法定位会话窗口" << strSender;
+    }
+}
+
 void ResHandler::mkdir()
 {
     bool ret;

@@ -222,6 +222,12 @@ void Client::handleMsg(PDU *pdu)
         m_prh->chat();
         break;
     }
+    case ENUM_TYPE_OFFLINE_MSG_RESEND:
+    {
+        // 登录成功后服务端补发的离线消息
+        m_prh->offlineMsg();
+        break;
+    }
     case ENUM_TYPE_MKDIR_RESPOND:
     {
         m_prh->mkdir();

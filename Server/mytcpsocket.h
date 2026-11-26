@@ -1,4 +1,4 @@
-﻿#ifndef MYTCPSOCKET_H
+#ifndef MYTCPSOCKET_H
 #define MYTCPSOCKET_H
 
 #include "msghandler.h"
@@ -23,6 +23,9 @@ public:
 
     // 最近一次活跃时间（毫秒时间戳），服务端心跳超时巡检用
     qint64 lastActiveMs() const { return m_lastActiveMs; }
+
+    // 登录成功后补发该用户的离线消息
+    void pushOfflineMessages();
 
 public slots:
     void recvMsg();
