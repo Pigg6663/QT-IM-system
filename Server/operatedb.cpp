@@ -77,6 +77,14 @@ bool operateDB::handleRegist(const char *caName, const char *caPwd)
     const QString name = toStr(caName);
     const QString pwd  = toStr(caPwd);
 
+    // 空用户名/空口令必须拒绝：否则会写入一条 name='' 的记录，
+    // 之后任何人拿空用户名+空口令都能登录成功（曾经真的发生过）。
+    if(name.isEmpty() || pwd.isEmpty())
+    {
+        qDebug()<<"注册被拒绝：用户名或口令为空";
+        return false;
+    }
+
     // 查重：预处理绑定，杜绝 SQL 注入
     QSqlQuery q;
     q.prepare("select id from user_info where name = :name");
@@ -116,6 +124,14 @@ bool operateDB::handleLogin(const char *caName, const char *caPwd)
     }
     const QString name = toStr(caName);
     const QString pwd  = toStr(caPwd);
+
+    // 同注册：空用户名/空口令一律无效，不能因为库里恰好存在
+    // name='' 的历史脏数据就放行。
+    if(name.isEmpty() || pwd.isEmpty())
+    {
+        qDebug()<<"登录被拒绝：用户名或口令为空";
+        return false;
+    }
 
     // 只取 id/pwd/salt，口令正确性在应用层用哈希比对
     QSqlQuery q;

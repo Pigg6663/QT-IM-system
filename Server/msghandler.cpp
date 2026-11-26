@@ -443,46 +443,195 @@ PDU *MsgHandler::moveFile()
     return makeBoolRespond(ENUM_TYPE_MOVE_FILE_RESPOND, ret);
 }
 
+// ---------------------------------------------------------------
+// 第 7 项：大文件分片上传
+//   1) UPLOAD_FILE_REQUEST        握手：文件名 + 总长 + 整文件 MD5
+//      服务端回 UPLOAD_FILE_RESPOND：断点位置 + 是否就绪
+//   2) UPLOAD_FILE_CHUNK_REQUEST  每个分片带自己的偏移，顺序推
+//   3) UPLOAD_FILE_FINISH_REQUEST 收尾，服务端校验长度与 MD5
+// 数据先落到 <目标路径>.part，校验通过才 rename 转正；不一致就删掉半成品，
+// 否则下次续传会接在一个已经坏掉的前缀上，越传越错。
+// ---------------------------------------------------------------
 PDU *MsgHandler::uploadFile()
 {
     char caFileName[32] = {'\0'};
     memcpy(caFileName, pdu->caData, 32);
-    // caMsg = "目标目录路径 + '\0' + 文件二进制数据"
+    qint64 llTotal = 0;
+    memcpy(&llTotal, pdu->caData + UPLOAD_SIZE_POS, sizeof(qint64));
+    const QByteArray md5Raw(pdu->caData + UPLOAD_MD5_POS, MD5_RAW_LEN);
+
     const QString strDir  = QString::fromUtf8(pdu->caMsg);
     const QString strPath = QString("%1/%2").arg(strDir).arg(caFileName);
-    qDebug() << "uploadFile path:" << strPath;
+    qDebug() << "uploadFile(init) path:" << strPath << "size:" << llTotal;
 
     PDU* errRespond = NULL;
-    // 只校验 '\0' 之前的路径部分，不能把文件体当路径
+    // caMsg 只有目录路径，文件名在 caData，两段都要卡在用户根目录内
     if (!isSafePathOrRespond(strDir, ENUM_TYPE_UPLOAD_FILE_RESPOND, &errRespond)
         || !isSafePathOrRespond(strPath, ENUM_TYPE_UPLOAD_FILE_RESPOND, &errRespond))
     {
         return errRespond;
     }
 
-    QFile file(strPath);
-    bool ret = false;
-    if (file.open(QIODevice::WriteOnly)) {
-        int pathLen = strlen(pdu->caMsg) + 1;
-        char* fileData = pdu->caMsg + pathLen;
-        int dataLen = pdu->uiMsgLen - pathLen;
-        if (dataLen > 0) {
-            file.write(fileData, dataLen);
-        }
-        file.close();
-        ret = true;
+    // 上一次上传没收到 FINISH 就来了新握手，直接作废
+    resetUploadSession();
+    if (llTotal < 0)
+    {
+        return makeBoolRespond(ENUM_TYPE_UPLOAD_FILE_RESPOND, false);
     }
-    qDebug() << "uploadFile ret:" << ret;
-    return makeBoolRespond(ENUM_TYPE_UPLOAD_FILE_RESPOND, ret);
+
+    m_uploadPath   = strPath + ".part";
+    m_uploadSize   = llTotal;
+    m_uploadMd5Hex = md5Raw.toHex();
+    m_uploadHash.reset(new QCryptographicHash(QCryptographicHash::Md5));
+
+    // 断点续传：上一次留下的 .part 有多大就从哪里接着收
+    qint64 llResume = QFileInfo(m_uploadPath).size();
+    if (llResume > llTotal)          // 比目标还大，说明不是同一次上传的残留
+    {
+        QFile::remove(m_uploadPath);
+        llResume = 0;
+    }
+
+    bool ok = false;
+    m_uploadOffset = 0;
+    m_uploadFile.reset(new QFile(m_uploadPath));
+    QIODevice::OpenMode mode = QIODevice::WriteOnly;
+    mode |= (llResume > 0) ? QIODevice::Append : QIODevice::Truncate;
+    if (m_uploadFile->open(mode))
+    {
+        ok = true;
+        m_uploadOffset = llResume;
+        if (llResume > 0)
+        {
+            // 续传时必须把已落盘的前缀重新喂进哈希，否则整文件 MD5 根本算不出来
+            QFile part(m_uploadPath);
+            if (part.open(QIODevice::ReadOnly))
+            {
+                while (!part.atEnd())
+                {
+                    const QByteArray block = part.read(int(FILE_CHUNK_SIZE));
+                    if (block.isEmpty())
+                    {
+                        break;
+                    }
+                    m_uploadHash->addData(block);
+                }
+                part.close();
+            }
+            qDebug() << "uploadFile 断点续传，已有" << llResume << "字节";
+        }
+    }
+    else
+    {
+        qWarning() << "无法创建临时文件:" << m_uploadPath << m_uploadFile->errorString();
+        resetUploadSession();
+    }
+
+    // 应答：[0:8] 断点位置 [8] 是否就绪
+    PDU* respdu = mkPDU();
+    respdu->uiType = ENUM_TYPE_UPLOAD_FILE_RESPOND;
+    memcpy(respdu->caData + UPLOAD_RESUME_POS, &m_uploadOffset, sizeof(qint64));
+    memcpy(respdu->caData + UPLOAD_OK_POS, &ok, sizeof(bool));
+    return respdu;
 }
 
+PDU *MsgHandler::uploadChunk()
+{
+    if (!m_uploadFile || !m_uploadFile->isOpen())
+    {
+        qWarning() << "收到分片但没有进行中的上传会话，丢弃";
+        return NULL;
+    }
+
+    qint64 llOffset = 0;
+    memcpy(&llOffset, pdu->caData + CHUNK_OFFSET_POS, sizeof(qint64));
+    if (llOffset != m_uploadOffset)
+    {
+        // 偏移必须严格连续：客户端是顺序推的，跳过或重复都说明字节流已经错位，
+        // 继续写下去只会得到一个看起来完整、实际错位的文件
+        qWarning() << "分片偏移不连续，期望" << m_uploadOffset << "实际" << llOffset;
+        return NULL;
+    }
+
+    const qint64 llWritten = m_uploadFile->write(pdu->caMsg, pdu->uiMsgLen);
+    if (llWritten != qint64(pdu->uiMsgLen))
+    {
+        qWarning() << "分片写盘失败:" << m_uploadFile->errorString();
+        return NULL;
+    }
+    m_uploadFile->flush();
+    m_uploadHash->addData(pdu->caMsg, int(pdu->uiMsgLen));
+    m_uploadOffset += llWritten;
+
+    // 分片不带逐片应答：一次上传几百上千片，逐片应答会明显拖慢速度。
+    // 真正的确认放在 FINISH 里，用"长度 + 整文件 MD5"双重校验。
+    return NULL;
+}
+
+PDU *MsgHandler::uploadFinish()
+{
+    bool ok = false;
+    if (m_uploadFile && m_uploadFile->isOpen())
+    {
+        m_uploadFile->close();
+        const QByteArray actualHex = m_uploadHash ? m_uploadHash->result().toHex() : QByteArray();
+        // 客户端在 FINISH 里再报一次整文件 MD5，与服务端边收边算的结果比对
+        // 按十六进制字符串比，不区分大小写：不同客户端可能发大写，语义是同一个摘要
+        const QByteArray expectHex = QByteArray(pdu->caData, MD5_HEX_LEN).toLower();
+        ok = (m_uploadOffset == m_uploadSize) && (actualHex == expectHex);
+        qDebug() << "uploadFinish 期望长度" << m_uploadSize << "实收" << m_uploadOffset
+                 << "服务端 MD5" << actualHex << "客户端声明" << expectHex << "一致" << ok;
+        if (ok)
+        {
+            const QString strFinalPath = m_uploadPath.left(m_uploadPath.size() - 5); // 去掉 ".part"
+            QFile::remove(strFinalPath);
+            ok = QFile::rename(m_uploadPath, strFinalPath);
+            if (!ok)
+            {
+                qWarning() << "重命名临时文件失败:" << m_uploadPath;
+            }
+        }
+        if (!ok)
+        {
+            QFile::remove(m_uploadPath);
+        }
+    }
+    resetUploadSession();
+    return makeBoolRespond(ENUM_TYPE_UPLOAD_FILE_FINISH_RESPOND, ok);
+}
+
+void MsgHandler::resetUploadSession()
+{
+    if (m_uploadFile)
+    {
+        if (m_uploadFile->isOpen())
+        {
+            m_uploadFile->close();
+        }
+        m_uploadFile.reset();
+    }
+    m_uploadPath.clear();
+    m_uploadSize   = 0;
+    m_uploadOffset = 0;
+    m_uploadMd5Hex.clear();
+    m_uploadHash.reset();
+}
+
+// ---------------------------------------------------------------
+// 第 7 项：下载握手
+// 客户端只说"要哪个文件、我本地已经有多少字节"，数据由 MyTcpSocket
+// 在握手应答发出去之后主动推（边读边推，靠 bytesWritten 反压），
+// 不再把整文件读进内存拼成一个 PDU。
+// ---------------------------------------------------------------
 PDU *MsgHandler::downloadFile()
 {
     char caFileName[32] = {'\0'};
     memcpy(caFileName, pdu->caData, 32);
-    const QString strDir  = QString(pdu->caMsg);
+    const QString strDir  = QString::fromUtf8(pdu->caMsg);
     const QString strPath = QString("%1/%2").arg(strDir).arg(caFileName);
-    qDebug() << "downloadFile path:" << strPath;
+    qint64 llResume = 0;
+    memcpy(&llResume, pdu->caData + DL_RESUME_POS, sizeof(qint64));
+    qDebug() << "downloadFile(init) path:" << strPath << "客户端已有:" << llResume;
 
     PDU* errRespond = NULL;
     if (!isSafePathOrRespond(strDir, ENUM_TYPE_DOWNLOAD_FILE_RESPOND, &errRespond)
@@ -491,60 +640,113 @@ PDU *MsgHandler::downloadFile()
         return errRespond;
     }
 
-    QFile file(strPath);
-    PDU* respdu = nullptr;
-    if (file.open(QIODevice::ReadOnly)) {
-        QByteArray fileData = file.readAll();
-        file.close();
-        QByteArray infoBytes = strDir.toUtf8();
-        int totalMsgLen = infoBytes.size() + 1 + fileData.size();
-        respdu = mkPDU(totalMsgLen);
-        respdu->uiType = ENUM_TYPE_DOWNLOAD_FILE_RESPOND;
-        memcpy(respdu->caData, caFileName, 32);
-        memcpy(respdu->caMsg, infoBytes.constData(), infoBytes.size() + 1);
-        memcpy(respdu->caMsg + infoBytes.size() + 1, fileData.constData(), fileData.size());
-    } else {
-        respdu = mkPDU();
-        respdu->uiType = ENUM_TYPE_DOWNLOAD_FILE_RESPOND;
-        bool ret = false;
-        memcpy(respdu->caData, &ret, sizeof(bool));
+    const QFileInfo info(strPath);
+    const bool ok = info.exists() && info.isFile();
+    qint64 llSize  = ok ? info.size() : 0;
+    qint64 llStart = llResume;
+    if (llStart < 0 || llStart > llSize)
+    {
+        llStart = 0;   // 客户端本地那份比服务端还大，只能从头传
     }
+
+    PDU* respdu = mkPDU();
+    respdu->uiType = ENUM_TYPE_DOWNLOAD_FILE_RESPOND;
+    memcpy(respdu->caData + DL_RESP_OK_POS, &ok, sizeof(bool));
+    memcpy(respdu->caData + DL_RESP_START_POS, &llStart, sizeof(qint64));
+    memcpy(respdu->caData + DL_RESP_SIZE_POS, &llSize, sizeof(qint64));
+
+    // 应答先发出去，数据流由调用方在 sendMsg 之后启动
+    m_bDownloadPending = ok;
+    m_downloadPath     = strPath;
+    m_downloadOffset   = llStart;
     return respdu;
 }
 
+QString MsgHandler::takeDownloadPath()
+{
+    m_bDownloadPending = false;
+    return m_downloadPath;
+}
+
+qint64 MsgHandler::takeDownloadOffset()
+{
+    return m_downloadOffset;
+}
+
+// ---------------------------------------------------------------
+// 分享文件：服务端在自己的磁盘上把文件复制进接收方网盘，再给接收方
+// 推一条系统通知。
+// 旧实现是把文件内容整包发给接收方客户端、由客户端写进 **本地** 目录，
+// 而网盘目录其实在服务端，结果"分享成功"了但对方网盘里看不到。
+// ---------------------------------------------------------------
 PDU *MsgHandler::shareFile()
 {
     char caFileName[32] = {'\0'};
     char caTarName[32] = {'\0'};
     memcpy(caFileName, pdu->caData, 32);
-    memcpy(caTarName, pdu->caData+32, 32);
-    const QString strDir  = QString(pdu->caMsg);
-    const QString strFilePath = QString("%1/%2").arg(strDir).arg(caFileName);
-    qDebug() << "shareFile path:" << strFilePath << "to user:" << caTarName;
+    memcpy(caTarName, pdu->caData + 32, 32);
+    const QString strDir = QString::fromUtf8(pdu->caMsg);
+    const QString strSrcPath = QString("%1/%2").arg(strDir).arg(caFileName);
+    const QString strTarName = QString::fromUtf8(caTarName, int(qstrnlen(caTarName, 32)));
+    qDebug() << "shareFile" << strSrcPath << "to user:" << strTarName;
 
     PDU* errRespond = NULL;
     // 只允许分享自己网盘目录内的文件
     if (!isSafePathOrRespond(strDir, ENUM_TYPE_SHARE_FILE_RESPOND, &errRespond)
-        || !isSafePathOrRespond(strFilePath, ENUM_TYPE_SHARE_FILE_RESPOND, &errRespond))
+        || !isSafePathOrRespond(strSrcPath, ENUM_TYPE_SHARE_FILE_RESPOND, &errRespond))
     {
         return errRespond;
     }
 
-    QFile file(strFilePath);
-    bool ret = false;
-    if (file.open(QIODevice::ReadOnly)) {
-        QByteArray fileData = file.readAll();
-        file.close();
-        int pathLen = strlen(pdu->caMsg) + 1;
-        int totalMsgLen = pathLen + fileData.size();
-        PDU* sharePdu = mkPDU(totalMsgLen);
-        sharePdu->uiType = ENUM_TYPE_SHARE_FILE_RESPOND;
-        memcpy(sharePdu->caData, caFileName, 32);
-        memcpy(sharePdu->caMsg, pdu->caMsg, pathLen);
-        memcpy(sharePdu->caMsg + pathLen, fileData.constData(), fileData.size());
-        MyTcpServer::getInstance().resend(caTarName, sharePdu);
-        free(sharePdu);
-        ret = true;
+    // 目标必须是已注册用户，且不能分享给自己。
+    // handleFindUser 返回 2 表示用户不存在；这里只借它做存在性判断。
+    if (strTarName.isEmpty()
+        || strTarName == m_loginName
+        || operateDB::getInstance().handleFindUser(strTarName.toUtf8().constData()) == 2)
+    {
+        qWarning() << "分享目标非法:" << strTarName;
+        return makeBoolRespond(ENUM_TYPE_SHARE_FILE_RESPOND, false);
     }
-    return makeBoolRespond(ENUM_TYPE_SHARE_FILE_RESPOND, ret);
+
+    const QString strTarDir = userRootAbs(strTarName);
+    QDir().mkpath(strTarDir);            // 老账号可能没有网盘目录，顺手补建
+    const QString strBaseName = QFileInfo(strSrcPath).fileName();
+    QString strDstPath = strTarDir + "/" + strBaseName;
+    // 同名文件不覆盖，加 (1)(2) 序号
+    for (int i = 1; QFile::exists(strDstPath) && i < 1000; ++i)
+    {
+        const QFileInfo fi(strBaseName);
+        const QString strSuffix = fi.suffix().isEmpty() ? QString() : "." + fi.suffix();
+        strDstPath = QString("%1/%2(%3)%4").arg(strTarDir).arg(fi.completeBaseName()).arg(i).arg(strSuffix);
+    }
+
+    bool ret = QFile::copy(strSrcPath, strDstPath);
+    if (!ret)
+    {
+        qWarning() << "分享复制失败:" << strSrcPath << "->" << strDstPath;
+        return makeBoolRespond(ENUM_TYPE_SHARE_FILE_RESPOND, false);
+    }
+
+    // 通知接收方。用 CHAT_RESEND 而不是新加一个类型：客户端本来就会把它
+    // 显示在对应会话窗口里，接收方在线就即时看到，离线则走离线消息补发。
+    const QString strNotice = QString("[系统] %1 向您分享了文件 %2，已存入您的网盘")
+                                  .arg(m_loginName)
+                                  .arg(QFileInfo(strDstPath).fileName());
+    const QByteArray noticeBytes = strNotice.toUtf8();
+    const QByteArray senderBytes = m_loginName.toUtf8();
+    const QByteArray targetBytes = strTarName.toUtf8();
+
+    PDU* noticePdu = mkPDU(noticeBytes.size());
+    noticePdu->uiType = ENUM_TYPE_CHAT_RESEND;
+    memcpy(noticePdu->caData, senderBytes.constData(), size_t(qMin(32, senderBytes.size())));
+    memcpy(noticePdu->caData + 32, targetBytes.constData(), size_t(qMin(32, targetBytes.size())));
+    memcpy(noticePdu->caMsg, noticeBytes.constData(), size_t(noticeBytes.size()));
+
+    if (!MyTcpServer::getInstance().resend(caTarName, noticePdu))
+    {
+        operateDB::getInstance().handleSaveOfflineMsg(m_loginName, strTarName, strNotice);
+    }
+    free(noticePdu);
+
+    return makeBoolRespond(ENUM_TYPE_SHARE_FILE_RESPOND, true);
 }

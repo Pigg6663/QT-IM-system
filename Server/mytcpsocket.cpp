@@ -3,7 +3,10 @@
 #include "operatedb.h"
 #include "protocol.h"
 
+#include <QCryptographicHash>
 #include <QDebug>
+#include <QFile>
+#include <QFileInfo>
 #include <cstring>
 
 MyTcpSocket::MyTcpSocket()
@@ -11,10 +14,14 @@ MyTcpSocket::MyTcpSocket()
     m_pmh = new MsgHandler;
     connect(this, &QTcpSocket::readyRead, this, &MyTcpSocket::recvMsg);
     connect(this, &QTcpSocket::disconnected, this, &MyTcpSocket::clineOffliine);
+    // 写缓冲腾空后接着推下一批分片：没有这个信号，要么一次全写进内存，
+    // 要么就靠 sleep 轮询，两种都不对
+    connect(this, &QTcpSocket::bytesWritten, this, &MyTcpSocket::pumpDownload);
 }
 
 MyTcpSocket::~MyTcpSocket()
 {
+    stopDownload();
     delete m_pmh;
 }
 
@@ -54,6 +61,9 @@ void MyTcpSocket::recvMsg()
         // 5) 业务处理（handleMsg 内部会 free(pdu)），再回包（sendMsg 内部也会 free）
         PDU* respdu = handleMsg(pdu);
         sendMsg(respdu);
+        // 6) 下载握手应答已经写出，此时才开始推文件数据，
+        //    否则首个分片可能比应答先到，客户端拿到无主的数据包
+        tryStartDownload();
     }
 }
 
@@ -77,6 +87,9 @@ void MyTcpSocket::sendMsg(PDU *pdu)
 
 void MyTcpSocket::clineOffliine()
 {
+    // 连接断了，正在推的下载立刻停掉并关闭文件句柄
+    stopDownload();
+
     // 未登录的连接没有登录名，不能拿空串去置 online=0
     if (!m_strLoginName.isEmpty())
     {
@@ -222,6 +235,17 @@ PDU *MyTcpSocket::handleMsg(PDU *pdu)
         respdu=m_pmh->uploadFile();
         break;
     }
+    case ENUM_TYPE_UPLOAD_FILE_CHUNK_REQUEST:
+    {
+        // 分片成功时没有应答包，返回 NULL
+        respdu=m_pmh->uploadChunk();
+        break;
+    }
+    case ENUM_TYPE_UPLOAD_FILE_FINISH_REQUEST:
+    {
+        respdu=m_pmh->uploadFinish();
+        break;
+    }
     case ENUM_TYPE_DOWNLOAD_FILE_REQUEST:
     {
         respdu=m_pmh->downloadFile();
@@ -273,4 +297,115 @@ void MyTcpSocket::pushOfflineMessages()
     }
 
     qDebug() << "已补发离线消息" << msgs.size() << "条 ->" << m_strLoginName;
+}
+
+// ---------------------------------------------------------------
+// 第 7 项：下载推流
+// 握手应答发出去之后才开始推；每次只写一个分片，写完看写缓冲水位，
+// 高水位以上就停下等 bytesWritten，避免把整个文件读进内存或堆满写缓冲。
+// ---------------------------------------------------------------
+void MyTcpSocket::tryStartDownload()
+{
+    if (!m_pmh || !m_pmh->hasPendingDownload())
+    {
+        return;
+    }
+
+    const QString strPath = m_pmh->takeDownloadPath();
+    const qint64 llStart  = m_pmh->takeDownloadOffset();
+
+    stopDownload();   // 上一条没推完就来了新请求，作废
+
+    m_downloadFile.reset(new QFile(strPath));
+    if (!m_downloadFile->open(QIODevice::ReadOnly))
+    {
+        qWarning() << "下载打开文件失败:" << strPath;
+        return;
+    }
+    m_downloadHash.reset(new QCryptographicHash(QCryptographicHash::Md5));
+    m_downloadSize   = m_downloadFile->size();
+    m_downloadOffset = llStart;
+
+    // 续传：先把跳过的前缀读一遍喂进哈希，否则算不出整文件 MD5
+    if (llStart > 0 && m_downloadFile->seek(0))
+    {
+        qint64 llRemain = llStart;
+        while (llRemain > 0)
+        {
+            const QByteArray block = m_downloadFile->read(qMin<qint64>(FILE_CHUNK_SIZE, llRemain));
+            if (block.isEmpty())
+            {
+                break;
+            }
+            m_downloadHash->addData(block);
+            llRemain -= block.size();
+        }
+    }
+    m_downloadFile->seek(m_downloadOffset);
+
+    qDebug() << "开始推送文件" << strPath << "从" << llStart << "起，总长" << m_downloadSize;
+    pumpDownload();
+}
+
+void MyTcpSocket::pumpDownload()
+{
+    if (!m_downloadFile || !m_downloadFile->isOpen())
+    {
+        return;
+    }
+
+    // 写缓冲水位以上就先不写：等 bytesWritten 回来继续
+    while (bytesToWrite() < SOCKET_WRITE_HIGH_WATER)
+    {
+        if (m_downloadOffset >= m_downloadSize)
+        {
+            // 收尾：整文件 MD5 一起下发，客户端据此判断拼出来的文件对不对
+            const QByteArray md5Raw = m_downloadHash->result();
+            PDU* respdu = mkPDU();
+            respdu->uiType = ENUM_TYPE_DOWNLOAD_FILE_FINISH_RESPOND;
+            bool ok = true;
+            memcpy(respdu->caData + DL_RESP_OK_POS, &ok, sizeof(bool));
+            memcpy(respdu->caData + DL_FINISH_MD5_POS, md5Raw.constData(), size_t(md5Raw.size()));
+            this->write((char*)respdu, respdu->uiTotalLen);
+            free(respdu);
+
+            qDebug() << "推送完成" << m_downloadFile->fileName() << "MD5" << md5Raw.toHex();
+            stopDownload();
+            return;
+        }
+
+        const qint64 llRemain = m_downloadSize - m_downloadOffset;
+        const QByteArray block = m_downloadFile->read(qMin<qint64>(FILE_CHUNK_SIZE, llRemain));
+        if (block.isEmpty())
+        {
+            qWarning() << "读取文件意外中断:" << m_downloadFile->fileName();
+            stopDownload();
+            return;
+        }
+
+        PDU* pdu = mkPDU(block.size());
+        pdu->uiType = ENUM_TYPE_DOWNLOAD_FILE_CHUNK_RESPOND;
+        memcpy(pdu->caData + CHUNK_OFFSET_POS, &m_downloadOffset, sizeof(qint64));
+        memcpy(pdu->caMsg, block.constData(), size_t(block.size()));
+        this->write((char*)pdu, pdu->uiTotalLen);
+        free(pdu);
+
+        m_downloadHash->addData(block);
+        m_downloadOffset += block.size();
+    }
+}
+
+void MyTcpSocket::stopDownload()
+{
+    if (m_downloadFile)
+    {
+        if (m_downloadFile->isOpen())
+        {
+            m_downloadFile->close();
+        }
+        m_downloadFile.reset();
+    }
+    m_downloadHash.reset();
+    m_downloadOffset = 0;
+    m_downloadSize   = 0;
 }

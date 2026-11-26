@@ -365,5 +365,24 @@ Start-Sleep -Milliseconds 1500
 $onlineAfterClose = Get-Online $userC
 Test-Result "唯一连接断开后 online 归 0" ($onlineAfterClose -eq 0) "(online=$onlineAfterClose)"
 
+# ============================================================
+#  空用户名 / 空口令必须被拒绝
+#  历史缺陷：caData 全为 0 时服务端用 name='' 去查库，
+#  只要库里存在一条 name='' 的脏记录就会被判成登录成功。
+# ============================================================
+Write-Host "`n[加固] 空用户名 / 空口令" -ForegroundColor Yellow
+
+$emptyReg = Reg-Or-Login -User "" -Pwd $pwd -Login $false
+Test-Result "空用户名注册被拒绝" ($emptyReg.Result.Type -eq $REGIST_RESPOND -and -not $emptyReg.Result.ResultBool)
+$emptyReg.Client.Close()
+
+$emptyLogin = Reg-Or-Login -User "" -Pwd $pwd
+Test-Result "空用户名登录被拒绝" ($emptyLogin.Result.Type -eq $LOGIN_RESPOND -and -not $emptyLogin.Result.ResultBool)
+$emptyLogin.Client.Close()
+
+$emptyPwd = Reg-Or-Login -User "emptyPwd_$suffix" -Pwd "" -Login $false
+Test-Result "空口令注册被拒绝" ($emptyPwd.Result.Type -eq $REGIST_RESPOND -and -not $emptyPwd.Result.ResultBool)
+$emptyPwd.Client.Close()
+
 Write-Host "`n=== 结果: $script:pass 通过 / $script:fail 失败 ===" -ForegroundColor Cyan
 if ($script:fail -gt 0) { exit 1 } else { exit 0 }

@@ -246,76 +246,188 @@ void ResHandler::moveFile()
     }
 }
 
+
+// ---------------------------------------------------------------
+// 第 7 项：分片传输 —— 上传握手应答
+// 客户端先发 UPLOAD_FILE_REQUEST（文件名 + 总长 + 整文件 MD5），
+// 服务端回"能从哪个字节开始"（断点），然后客户端才推分片。
+// ---------------------------------------------------------------
 void ResHandler::uploadFile()
 {
-    bool ret;
-    memcpy(&ret, pdu->caData, sizeof(bool));
-    qDebug() << "uploadFile ret" << ret;
-    if (ret) {
-        QMessageBox::information(&Index::getInstance(), "提示", "上传成功");
-        Index::getInstance().getFile()->flushFile();
-    } else {
-        QMessageBox::information(&Index::getInstance(), "提示", "上传失败");
+    qint64 llResume = 0;
+    bool ok = false;
+    memcpy(&llResume, pdu->caData + UPLOAD_RESUME_POS, sizeof(qint64));
+    memcpy(&ok, pdu->caData + UPLOAD_OK_POS, sizeof(bool));
+    qDebug() << "uploadFile 握手 ok:" << ok << "断点:" << llResume;
+
+    if (!ok)
+    {
+        Client::getInstance().abortUpload();
+        QMessageBox::information(&Index::getInstance(), "提示", "上传失败：服务端无法创建文件");
+        return;
     }
+
+    if (llResume > 0)
+    {
+        QMessageBox::information(&Index::getInstance(), "提示",
+                                 QString("检测到未完成的上传，从 %1 字节处续传").arg(llResume));
+    }
+    // 真正的"上传成功/失败"在 UPLOAD_FILE_FINISH_RESPOND 里
+    Client::getInstance().continueUpload(llResume);
 }
 
+// ---------------------------------------------------------------
+// 第 7 项：下载握手应答 —— 打开本地文件，准备接分片
+// ---------------------------------------------------------------
 void ResHandler::downloadFile()
 {
-    // caData contains the file name, caMsg contains path + file data
-    char caFileName[32] = {'\0'};
-    memcpy(caFileName, pdu->caData, 32);
-    qDebug() << "downloadFile fileName:" << caFileName;
+    bool ok = false;
+    qint64 llStart = 0;
+    qint64 llSize  = 0;
+    memcpy(&ok, pdu->caData + DL_RESP_OK_POS, sizeof(bool));
+    memcpy(&llStart, pdu->caData + DL_RESP_START_POS, sizeof(qint64));
+    memcpy(&llSize, pdu->caData + DL_RESP_SIZE_POS, sizeof(qint64));
+    qDebug() << "downloadFile 握手 ok:" << ok << "起始:" << llStart << "总长:" << llSize;
 
-    // Check if download succeeded (caData has file info)
-    if (pdu->uiMsgLen > 0) {
-        // Extract path info and file data from caMsg
-        QString strPathInfo = QString(pdu->caMsg);
-        int pathLen = strPathInfo.toUtf8().size() + 1;
-        QByteArray fileData(pdu->caMsg + pathLen, pdu->uiMsgLen - pathLen);
-
-        QString strSavePath = QString("%1/%2").arg(File::getInstance().m_strUserPath).arg(caFileName);
-        QString strSelectedPath = QFileDialog::getSaveFileName(&Index::getInstance(), "保存文件", caFileName);
-        if (strSelectedPath.isEmpty()) {
-            return;
-        }
-
-        QFile file(strSelectedPath);
-        if (file.open(QIODevice::WriteOnly)) {
-            file.write(fileData);
-            file.close();
-            QMessageBox::information(&Index::getInstance(), "提示", "下载成功");
-        } else {
-            QMessageBox::information(&Index::getInstance(), "提示", "下载失败：无法保存文件");
-        }
-    } else {
+    abortDownload();
+    if (!ok)
+    {
         QMessageBox::information(&Index::getInstance(), "提示", "下载失败：文件不存在");
+        return;
+    }
+    if (m_downloadSavePath.isEmpty())
+    {
+        QMessageBox::information(&Index::getInstance(), "提示", "下载失败：没有指定保存位置");
+        return;
+    }
+
+    m_downloadFile.reset(new QFile(m_downloadSavePath));
+    if (!m_downloadFile->open(QIODevice::ReadWrite))
+    {
+        QMessageBox::information(&Index::getInstance(), "提示",
+                                 QString("下载失败：无法保存文件 %1").arg(m_downloadSavePath));
+        abortDownload();
+        return;
+    }
+
+    // 服务端可能不认可我们提议的断点（本地那份比服务端还大），以服务端为准
+    m_downloadFile->resize(llStart);
+    m_downloadFile->seek(llStart);
+    m_downloadOffset = llStart;
+    m_downloadTotal  = llSize;
+    m_downloadHash.reset(new QCryptographicHash(QCryptographicHash::Md5));
+
+    // 续传：先把已有的前缀读一遍喂进哈希，收尾时才能和整文件 MD5 对上
+    if (llStart > 0)
+    {
+        m_downloadFile->seek(0);
+        qint64 llRemain = llStart;
+        while (llRemain > 0)
+        {
+            const QByteArray block = m_downloadFile->read(qMin<qint64>(FILE_CHUNK_SIZE, llRemain));
+            if (block.isEmpty())
+            {
+                break;
+            }
+            m_downloadHash->addData(block);
+            llRemain -= block.size();
+        }
+        m_downloadFile->seek(llStart);
     }
 }
 
+void ResHandler::downloadChunk()
+{
+    if (!m_downloadFile || !m_downloadFile->isOpen())
+    {
+        return;
+    }
+
+    qint64 llOffset = 0;
+    memcpy(&llOffset, pdu->caData + CHUNK_OFFSET_POS, sizeof(qint64));
+    if (llOffset != m_downloadOffset)
+    {
+        qWarning() << "下载分片偏移不连续，期望" << m_downloadOffset << "实际" << llOffset;
+        abortDownload();
+        QMessageBox::information(&Index::getInstance(), "提示", "下载中断：数据错位，请重新下载");
+        return;
+    }
+
+    if (m_downloadFile->write(pdu->caMsg, pdu->uiMsgLen) != qint64(pdu->uiMsgLen))
+    {
+        abortDownload();
+        QMessageBox::information(&Index::getInstance(), "提示", "下载失败：写入本地文件出错");
+        return;
+    }
+    m_downloadHash->addData(pdu->caMsg, int(pdu->uiMsgLen));
+    m_downloadOffset += pdu->uiMsgLen;
+}
+
+void ResHandler::downloadFinish()
+{
+    if (!m_downloadFile || !m_downloadFile->isOpen())
+    {
+        return;
+    }
+    m_downloadFile->close();
+
+    bool ok = false;
+    memcpy(&ok, pdu->caData + DL_RESP_OK_POS, sizeof(bool));
+    const QByteArray expectMd5(pdu->caData + DL_FINISH_MD5_POS, MD5_RAW_LEN);
+    const QByteArray actualMd5 = m_downloadHash ? m_downloadHash->result() : QByteArray();
+    const bool sizeOk = (m_downloadOffset == m_downloadTotal);
+    const bool md5Ok  = (actualMd5 == expectMd5);
+    const QString strPath = m_downloadFile->fileName();
+
+    m_downloadFile.reset();
+    m_downloadHash.reset();
+    m_downloadOffset = 0;
+    m_downloadTotal  = 0;
+
+    if (ok && sizeOk && md5Ok)
+    {
+        QMessageBox::information(&Index::getInstance(), "提示", "下载成功");
+        return;
+    }
+
+    // 校验不过的残file留着没意义，还会污染下次续传
+    QFile::remove(strPath);
+    QMessageBox::information(&Index::getInstance(), "提示",
+                             QString("下载失败：文件校验不通过（长度%1，MD5%2）")
+                                 .arg(sizeOk ? "正确" : "不符")
+                                 .arg(md5Ok ? "正确" : "不符"));
+}
+
+void ResHandler::abortDownload()
+{
+    if (m_downloadFile)
+    {
+        if (m_downloadFile->isOpen())
+        {
+            m_downloadFile->close();
+        }
+        m_downloadFile.reset();
+    }
+    m_downloadHash.reset();
+    m_downloadOffset = 0;
+    m_downloadTotal  = 0;
+}
+
+// ---------------------------------------------------------------
+// 分享：服务端负责把文件复制进接收方网盘，客户端只等一个 bool。
+// 接收方收到的是 CHAT_RESEND 系统通知，不再由客户端写本地文件。
+// ---------------------------------------------------------------
 void ResHandler::shareFile()
 {
     bool ret;
     memcpy(&ret, pdu->caData, sizeof(bool));
     qDebug() << "shareFile ret" << ret;
-    if (ret) {
-        QMessageBox::information(&Index::getInstance(), "提示", "分享成功");
-    } else {
-        QMessageBox::information(&Index::getInstance(), "提示", "分享失败");
+    if (ret)
+    {
+        QMessageBox::information(&Index::getInstance(), "提示", "分享成功，对方网盘中已生成副本");
     }
-    // Also handle receiving shared files
-    if (pdu->uiMsgLen > 0) {
-        char caFileName[32] = {'\0'};
-        memcpy(caFileName, pdu->caData, 32);
-        QString strPathInfo = QString(pdu->caMsg);
-        int pathLen = strPathInfo.toUtf8().size() + 1;
-        QByteArray fileData(pdu->caMsg + pathLen, pdu->uiMsgLen - pathLen);
-
-        QString strSavePath = QString("%1/%2").arg(Index::getInstance().getFile()->m_strUserPath).arg(caFileName);
-        QFile file(strSavePath);
-        if (file.open(QIODevice::WriteOnly)) {
-            file.write(fileData);
-            file.close();
-            QMessageBox::information(&Index::getInstance(), "分享文件", QString("收到来自好友的分享文件：%1，已保存到你的目录").arg(caFileName));
-        }
+    else
+    {
+        QMessageBox::information(&Index::getInstance(), "提示", "分享失败：目标用户不存在或文件无法复制");
     }
 }

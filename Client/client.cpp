@@ -26,6 +26,9 @@ Client::Client(QWidget *parent)
     connect(&m_socket,&QTcpSocket::readyRead,this,&Client::recvMsg);
     connect(&m_socket,&QTcpSocket::disconnected,this,&Client::onSocketDisconnected);
 
+    // 第 7 项：上传靠"写缓冲低于水位线"驱动，服务端同理
+    connect(&m_socket, &QTcpSocket::bytesWritten, this, &Client::pumpUpload);
+
     // 心跳：定时发 HEARTBEAT_REQUEST，让服务端知道本连接仍然存活
     m_heartbeatTimer.setInterval(kHeartbeatIntervalMs);
     connect(&m_heartbeatTimer, &QTimer::timeout, this, [this]() {
@@ -258,9 +261,35 @@ void Client::handleMsg(PDU *pdu)
         m_prh->uploadFile();
         break;
     }
+    case ENUM_TYPE_UPLOAD_FILE_FINISH_RESPOND:
+    {
+        bool ret = false;
+        memcpy(&ret, pdu->caData, sizeof(bool));
+        qDebug() << "upload finish ret" << ret;
+        if (ret)
+        {
+            QMessageBox::information(this, "提示", "上传成功");
+            Index::getInstance().getFile()->flushFile();
+        }
+        else
+        {
+            QMessageBox::information(this, "提示", "上传失败：文件校验不通过（长度或 MD5 不一致）");
+        }
+        break;
+    }
     case ENUM_TYPE_DOWNLOAD_FILE_RESPOND:
     {
         m_prh->downloadFile();
+        break;
+    }
+    case ENUM_TYPE_DOWNLOAD_FILE_CHUNK_RESPOND:
+    {
+        m_prh->downloadChunk();
+        break;
+    }
+    case ENUM_TYPE_DOWNLOAD_FILE_FINISH_RESPOND:
+    {
+        m_prh->downloadFinish();
         break;
     }
     case ENUM_TYPE_SHARE_FILE_RESPOND:
@@ -341,4 +370,99 @@ void Client::on_pushButton_2_clicked()
             <<"pdu->caMsg"<<pdu->caMsg;
     free(pdu);
     pdu=NULL;
+}
+
+// ---------------------------------------------------------------
+// 第 7 项：分片上传状态机
+// 流程：File 页选好文件算完 MD5 → beginUpload 接管 QFile 句柄 → File 页发握手
+//      → UPLOAD_FILE_RESPOND 带回断点 → continueUpload → pumpUpload 持续推分片
+//      → 全部推完发 UPLOAD_FILE_FINISH_REQUEST（带整文件 MD5 十六进制）
+// ---------------------------------------------------------------
+void Client::beginUpload(QFile* pFile, qint64 llTotal, const QByteArray& md5Hex)
+{
+    abortUpload();
+    m_uploadFile.reset(pFile);
+    m_uploadTotal  = llTotal;
+    m_uploadOffset = 0;
+    m_uploadMd5Hex = md5Hex;
+}
+
+void Client::continueUpload(qint64 llResume)
+{
+    if (!m_uploadFile || !m_uploadFile->isOpen())
+    {
+        qWarning() << "continueUpload：没有待上传的文件";
+        return;
+    }
+    if (llResume < 0 || llResume > m_uploadTotal)
+    {
+        llResume = 0;
+    }
+    if (!m_uploadFile->seek(llResume))
+    {
+        qWarning() << "continueUpload：seek 失败" << llResume;
+        abortUpload();
+        return;
+    }
+    m_uploadOffset = llResume;
+    pumpUpload();
+}
+
+void Client::abortUpload()
+{
+    if (m_uploadFile)
+    {
+        if (m_uploadFile->isOpen())
+        {
+            m_uploadFile->close();
+        }
+        m_uploadFile.reset();
+    }
+    m_uploadTotal  = 0;
+    m_uploadOffset = 0;
+    m_uploadMd5Hex.clear();
+}
+
+void Client::pumpUpload()
+{
+    if (!m_uploadFile || !m_uploadFile->isOpen())
+    {
+        return;
+    }
+
+    // 写缓冲到水位线就停，等 bytesWritten 再来：这样无论文件多大，内存占用都是两三个分片
+    while (m_socket.bytesToWrite() < SOCKET_WRITE_HIGH_WATER)
+    {
+        if (m_uploadOffset >= m_uploadTotal)
+        {
+            PDU* pdu = mkPDU();
+            pdu->uiType = ENUM_TYPE_UPLOAD_FILE_FINISH_REQUEST;
+            memcpy(pdu->caData, m_uploadMd5Hex.constData(),
+                   size_t(qMin(int(MD5_HEX_LEN), m_uploadMd5Hex.size())));
+            sendMsg(pdu);                    // sendMsg 内部负责 write + free
+
+            if (m_uploadFile->isOpen())
+            {
+                m_uploadFile->close();
+            }
+            m_uploadFile.reset();
+            return;
+        }
+
+        const QByteArray block = m_uploadFile->read(FILE_CHUNK_SIZE);
+        if (block.isEmpty())
+        {
+            qWarning() << "上传文件读取不足，还差" << (m_uploadTotal - m_uploadOffset) << "字节";
+            abortUpload();
+            return;
+        }
+
+        PDU* pdu = mkPDU(block.size());
+        pdu->uiType = ENUM_TYPE_UPLOAD_FILE_CHUNK_REQUEST;
+        memcpy(pdu->caData + CHUNK_OFFSET_POS, &m_uploadOffset, sizeof(qint64));
+        memcpy(pdu->caMsg, block.constData(), size_t(block.size()));
+        sendMsg(pdu);
+
+        m_uploadOffset += block.size();
+    }
 }

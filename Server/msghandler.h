@@ -3,7 +3,12 @@
 
 #include "protocol.h"
 
+#include <QByteArray>
+#include <QCryptographicHash>
 #include <QString>
+#include <memory>
+
+class QFile;
 
 
 
@@ -35,9 +40,18 @@ public:
     PDU* delDir();
     PDU* renameFile();
     PDU* moveFile();
-    PDU* uploadFile();
-    PDU* downloadFile();
+    PDU* uploadFile();       // 上传握手：校验路径 + 返回断点位置
+    PDU* uploadChunk();      // 上传分片：追加写 .part
+    PDU* uploadFinish();     // 上传收尾：校验长度与 MD5 后转正
+    PDU* downloadFile();     // 下载握手：校验路径 + 记录待推文件信息
     PDU* shareFile();
+
+    // ---- 下载推流状态（由 MyTcpSocket 在应答发出后消费）----
+    bool hasPendingDownload() const { return m_bDownloadPending; }
+    QString takeDownloadPath();
+    qint64 takeDownloadOffset();
+    // 上传分片会话在出错/完成后复位
+    void resetUploadSession();
 
 private:
     // 判断客户端传入的路径是否严格落在当前用户网盘根目录内
@@ -55,6 +69,19 @@ private:
 
     // 身份校验失败时构造失败应答
     PDU* makeIdentityRejectRespond(ENUM_TYPE respondType) const;
+
+    // ---- 上传分片会话（一条连接同时只处理一次上传）----
+    QString  m_uploadPath;      // .part 文件的绝对路径
+    qint64   m_uploadSize = 0;  // 客户端声明的文件总长
+    qint64   m_uploadOffset = 0;// 已经收到并落盘的字节数
+    QByteArray m_uploadMd5Hex;  // 客户端声明的整文件 MD5（hex）
+    std::unique_ptr<QFile> m_uploadFile;               // 跨消息持有，避免每片重开
+    std::unique_ptr<QCryptographicHash> m_uploadHash;  // 边收边算，避免收完再整读一遍
+
+    // ---- 下载推流会话 ----
+    bool    m_bDownloadPending = false;
+    QString m_downloadPath;
+    qint64  m_downloadOffset = 0;
 };
 
 #endif // MSGHANDLER_H

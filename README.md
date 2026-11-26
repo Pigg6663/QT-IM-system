@@ -52,7 +52,7 @@
 │   ├── server.{h,cpp}          # 单例：读取配置、启动监听、网盘根目录
 │   ├── mytcpserver.{h,cpp}     # 单例：管理连接、消息转发、心跳巡检、互踢
 │   ├── mytcpsocket.{h,cpp}     # 每个连接一个：收包状态机 -> 分发 -> 回包
-│   ├── msghandler.{h,cpp}      # 业务逻辑层：20 个业务处理函数 + 路径越权校验
+│   ├── msghandler.{h,cpp}      # 业务逻辑层：业务处理函数 + 路径越权校验 + 分片上传下载会话
 │   ├── operatedb.{h,cpp}       # 单例：预处理绑定的数据库访问 + 口令加盐哈希
 │   ├── protocol.{h,cpp}        # 协议定义（与客户端逐字节一致）
 │   └── connect.config.txt      # 监听 IP / 端口（必须 CRLF 换行，编译进 qrc）
@@ -67,8 +67,9 @@
     ├── test_protocol.ps1       # 粘包 / 半包 / 非法包长
     ├── test_heartbeat.ps1      # 心跳 / 重复登录互踢 / 超时回收
     ├── test_security.ps1       # SQL 注入 / 口令哈希 / 路径越权
-    ├── test_auth.ps1           # 未登录拦截 / 冒名操作 / 互踢后 online 状态
-    └── test_offline.ps1        # 离线落库 / 登录补发顺序 / 已读不重发
+    ├── test_auth.ps1           # 未登录拦截 / 冒名操作 / 互踢后 online 状态 / 空口令
+    ├── test_offline.ps1        # 离线落库 / 登录补发顺序 / 已读不重发
+    └── test_chunk.ps1          # 分片上传下载 / 断点续传 / MD5 校验 / 服务端分享
 ```
 
 ---
@@ -154,7 +155,8 @@ static_assert(sizeof(PDU) == 76, "PDU header layout broken");
 | 聊天 | 聊天 |
 | 网盘 | 新建文件夹、刷新文件列表、删除文件/文件夹、重命名、移动文件、上传、下载、分享文件 |
 | 保活 | 心跳（`HEARTBEAT_REQUEST` / `HEARTBEAT_RESPOND`） |
-| 服务端主动下发 | `ADD_FRIEND_RESEND`（加好友请求转发）、`CHAT_RESEND`（聊天消息转发）、`KICKED_RESEND`（重复登录踢线通知） |
+| 服务端主动下发 | `ADD_FRIEND_RESEND`（加好友请求转发）、`CHAT_RESEND`（聊天消息转发）、`KICKED_RESEND`（重复登录踢线通知）、`OFFLINE_MSG_RESEND`（离线消息补发） |
+| 文件分片 | `UPLOAD_FILE_CHUNK_REQUEST`、`UPLOAD_FILE_FINISH_REQUEST/RESPOND`、`DOWNLOAD_FILE_CHUNK_RESPOND`、`DOWNLOAD_FILE_FINISH_RESPOND` |
 
 > ⚠️ **枚举只能追加在 `ENUM_TYPE_MAX` 之前（即末尾）**。协议靠数值传输，
 > 若把新类型插到中间，后面所有类型的数值都会整体后移，新旧客户端直接对不上。
@@ -261,7 +263,9 @@ A 发送 `CHAT_REQUEST`（caData：`A` | `B`，caMsg：消息内容）→ 服务
 **5. 网盘操作**
 客户端只发送「操作意图」（当前路径 + 文件名等），服务端先用 `isSafePath()` 校验路径落在用户根目录内，
 再通过 `QDir` / `QFile` 实际执行并返回 `bool`。
-上传时客户端将文件数据拼入 PDU 一次性发出；下载 / 分享时服务端读取文件拼入 PDU 下发。
+上传 / 下载都按 **256 KB 分片**传输：上传由客户端连续推分片、服务端 append 到 `.part` 并增量算 MD5，
+收完后比对整文件 MD5 才 `rename` 转正；下载由服务端在发送缓冲低于 1 MB 水位时主动续推分片。
+两者都支持断点续传。分享不再转发文件内容，而是由**服务端**把文件复制进对方的用户目录并发一条通知。详见 9.9。
 
 **6. 连接保活**
 客户端每 15s 发一次 `HEARTBEAT_REQUEST`，服务端只回包不查库；
@@ -387,20 +391,22 @@ powershell -ExecutionPolicy Bypass -File tests\test_security.ps1
 | 4 | 服务端完全信任客户端传入的路径（路径穿越） | ✅ 已修复 | 由会话登录名拼出根目录，`QDir::cleanPath` 后做带分隔符的前缀断言 |
 | 5 | 口令明文存储 | ✅ 已修复 | 每用户 16 字节随机盐 + SHA-256；历史明文登录时惰性升级 |
 | 6 | SQL 全部为字符串拼接（注入风险） | ✅ 已修复 | 全量改 `QSqlQuery::prepare()` + `bindValue()`（12 处 prepare / 19 处 bind） |
-| 7 | 大文件整包读入内存 | ⏳ 待办 | 计划改分片传输（固定分片 + 序号）+ 校验和 + 断点续传 |
+| 7 | 大文件整包读入内存 | ✅ 已修复 | 256 KB 固定分片 + 偏移序号 + 整文件 MD5 校验 + `.part` 断点续传；下行由服务端按 `bytesWritten` 反压主动推送 |
 | 8 | 无离线消息，对方离线即丢弃 | ✅ 已修复 | 对方不在线时消息落 `message` 表；登录应答后排队补发（每批上限 200 条），补发即标记已读 |
 | 9 | 服务端单线程处理，慢操作阻塞全部连接 | ⏳ 待办 | 连接层留在主线程（`QTcpSocket` 有线程亲和性），业务投递线程池；`QSqlDatabase` 需每线程独立连接 |
 | 10 | 聊天窗口全局复用，跨会话串消息、可能回复错人 | ✅ 已修复 | 按好友维度维护 `QMap<QString, Chat*>`，窗口的会话对象只在创建时赋值一次 |
 | 11 | 重复登录踢人后，账号被错误置为离线 | ✅ 已修复 | 断线时先判定是否还有同名有效连接，有则保持 `online = 1` |
 | 12 | 服务端不校验操作身份，可冒充他人 | ✅ 已修复 | 分发入口加登录态拦截 + `caData` 自称身份与会话登录名强校验 |
+| 13 | 空用户名 / 空口令能注册、能登录 | ✅ 已修复 | 凭据入口直接拒绝空值；库里历史遗留的 `name=''` 脏记录已清理 |
 
 关于第 9 项：Qt 的 `QSqlDatabase` 连接与创建它的线程绑定，不能跨线程共享。
 所以"直接加线程池"是错的，正确顺序是先做连接管理（每线程独立连接 / 连接池），再线程化业务——这个取舍本身值得展开讲。
 
 第 11、12 项是后期复查中发现的两处缺陷，详见 9.6。
 第 8 项（离线消息）与第 10 项（多会话窗口）的完整实现思路见 9.7、9.8。
-剩余的第 7、9 项属于**架构级改造**（协议要重新设计 / 并发模型要换），
-不在本轮范围内，仍在待办中——这里如实标 ⏳，不把"知道怎么做"写成"已经做完"。
+第 7 项（大文件分片）的实现与取舍见 9.9。
+仅剩第 9 项（服务端单线程）属于**架构级改造**（并发模型要整体替换，
+还要先解决 `QSqlDatabase` 的线程绑定），如实标 ⏳，不把"知道怎么做"写成"已经做完"。
 
 ### 9.2 健壮性：收包状态机（第 1 项）
 
@@ -456,7 +462,7 @@ void MyTcpSocket::recvMsg()
 - 登录成功后 `kickDuplicate(登录名, this)`：先下发 `KICKED_RESEND` 再断开旧连接，
   传 `this` 是为了避免把自己踢掉。顺序必须是**先**让 `login()` 写好 `m_strLoginName`，**再**踢人。
 
-### 9.4 安全加固（第 4、5、6 项）
+### 9.4 安全加固（第 4、5、6、13 项）
 
 - **SQL**：全部改为预处理绑定；`const char*` 参数统一走 `QString::fromUtf8`
   （客户端用 `toStdString()` 发送，是 UTF-8，用 `fromLocal8Bit` 会让中文用户名乱码）。
@@ -466,8 +472,12 @@ void MyTcpSocket::recvMsg()
   客户端路径先 `QDir::cleanPath()` 消解 `..`，再断言 `abs == root || abs.startsWith(root + "/")`。
   带分隔符比较是必需的，否则 `/userdata/alice2` 会被误判为在 `/userdata/alice` 之内。
   已覆盖 8 处文件操作（`mkdir` / `flushFile` / `delDir` / `renameFile` / `moveFile` / `uploadFile` / `downloadFile` / `shareFile`），
-  其中 `renameFile` 与 `moveFile` 对**源和目标**都校验。
-  `uploadFile` 的 `caMsg` 是"路径 + `\0` + 文件体"，只校验 `strlen` 之前的路径部分。
+  其中 `renameFile` 与 `moveFile` 对**源和目标**都校验，`shareFile` 还要校验目标用户确实存在。
+- **空凭据**：`handleRegist` / `handleLogin` 会拒绝空用户名与空口令。
+  这一条是第 7 项测试时被逼出来的——脚本构造的 `caData` 全为 0（PowerShell 数组展开踩坑，见 9.10 末尾），
+  服务端却回了"登录成功"：因为库里已经有一条 `name=''` 的脏记录，
+  空用户名查到了它、空口令又恰好和它的哈希匹配。**能构造出一条身份为空的"成功登录"，
+  说明凭据校验不能只依赖"查得到记录"**。已同时清掉历史脏数据。
 
 ### 9.5 关于 `resend()` 的比较写法（已澄清，非缺陷）
 
@@ -689,7 +699,93 @@ Chat* Friend::openChat(const QString& strPeerName)
 代价：窗口数量随聊天过的好友数增长，一个好友一个窗口，没有做数量上限。
 对本项目（演示规模）可以接受，真要长期运行应加 LRU 关窗或改成单窗口多会话页签。
 
-### 9.9 测试脚本与验证方式
+### 9.9 大文件分片与断点续传（第 7 项）
+
+原实现的两个方向都是"整个文件读进内存再发一个 PDU"：
+
+```cpp
+// 原写法（客户端上传 / 下载、服务端转发都是这个形状）
+QByteArray baData = file.readAll();          // 文件多大就占多大内存
+PDU* pdu = mkPDU(baData.size());
+memcpy(pdu->caMsg, baData.constData(), baData.size());
+```
+
+一个 2 GB 的文件会直接要 2 GB 连续内存，`caMsg` 的 `uint` 长度也早就溢出了。
+另外没有任何完整性校验，传输出错只能靠用户肉眼发现；断线后只能从头再来。
+
+改造后协议新增 5 个消息类型（`Server/protocol.h` 与 `Client/protocol.h` 内容完全一致）：
+
+| 消息 | 值 | `caData` 布局 | `caMsg` |
+|---|---|---|---|
+| `UPLOAD_FILE_REQUEST`（复用） | 31 | `[0:32]`文件名 `[32:40]`uint64 总长 `[40:56]`16 字节原始 MD5 | 目标目录 |
+| `UPLOAD_FILE_RESPOND`（复用） | 32 | `[0:8]`uint64 断点 `[8]`bool 是否接受 | — |
+| `UPLOAD_FILE_CHUNK_REQUEST` | 41 | `[0:8]`uint64 本片偏移 | 分片数据（≤ 256 KB） |
+| `UPLOAD_FILE_FINISH_REQUEST` | 42 | `[0:32]`整文件 MD5（hex） | — |
+| `UPLOAD_FILE_FINISH_RESPOND` | 43 | `[0]`bool 校验是否通过 | — |
+| `DOWNLOAD_FILE_REQUEST`（复用） | 33 | `[0:32]`文件名 `[32:40]`uint64 客户端已有大小 | 目标目录 |
+| `DOWNLOAD_FILE_RESPOND`（复用） | 34 | `[0]`bool `[1:9]`uint64 起始偏移 `[9:17]`uint64 总长 | — |
+| `DOWNLOAD_FILE_CHUNK_RESPOND` | 44 | `[0:8]`uint64 本片偏移 | 分片数据（≤ 256 KB） |
+| `DOWNLOAD_FILE_FINISH_RESPOND` | 45 | `[0]`bool `[1:17]`整文件原始 MD5 | — |
+
+把 16 字节**原始** MD5 塞进 `caData` 而不是 32 字节 hex，是为了让"文件名 + 总长 + MD5"
+刚好占满 64 字节的 `caData`，不用为握手单独加字段。
+
+**上传流程**（`Client/file.cpp::on_upload_PB_clicked` → `Client/client.cpp::pumpUpload`
+→ `Server/msghandler.cpp::uploadFile/uploadChunk/uploadFinish`）：
+
+1. 客户端**流式**把文件读一遍算整文件 MD5（每次只读 256 KB，内存占用与文件大小无关），`seek(0)`；
+2. 发握手：文件名 + 总长 + MD5；服务端按 `<目标路径>.part` 的实际大小回一个断点；
+   断点比总长还大说明 `.part` 是坏的，直接删掉重来；
+3. 客户端从断点开始连续发分片，**不做逐片应答**——TCP 本身有序可靠，
+   逐片 ack 只会把速度压到 RTT 级别；
+4. 传完发 `UPLOAD_FILE_FINISH_REQUEST`，服务端比对长度和 MD5：
+   一致才把 `.part` `rename` 成正式文件；不一致删掉 `.part`（否则坏前缀会被下次续传当成好数据）。
+
+**下行为什么改成服务端主动推**：下载方向如果也做成"客户端要一片、服务端给一片"，
+那么每片都要等一个 RTT，3 MB 就是十几次往返。现在的做法是客户端只发**一次**握手，
+服务端随后按发送缓冲水位自己续推：
+
+```cpp
+// Server/mytcpsocket.cpp::pumpDownload()，由 QTcpSocket::bytesWritten 驱动
+while (bytesToWrite() < SOCKET_WRITE_HIGH_WATER) {   // 1 MB 水位
+    qint64 llRead = m_downloadFile->read(FILE_CHUNK_SIZE);
+    // ... 组 DOWNLOAD_FILE_CHUNK_RESPOND 写出去
+}
+```
+
+`bytesWritten` 只在缓冲排空一部分后才会再触发，于是形成天然的**反压**：
+客户端读得慢，服务端的发送缓冲就一直高于水位，推送自动停下，不会把内存撑爆。
+读到 EOF 时补一个 `DOWNLOAD_FILE_FINISH_RESPOND`，带上服务端流式计算出的整文件 MD5，
+客户端边收边写、同时增量算 MD5，收完后比对长度 + MD5。
+
+**断点续传的两个细节**（都是实际调试中踩到的）：
+
+- 服务端在续传时要把已经落盘的前缀**重新喂给 `QCryptographicHash`**，否则只有后半段参与
+  哈希，校验必然失败；上传（读回 `.part`）和下载（读回本地文件前缀）两侧都要做；
+- 客户端下载分片时校验 `caData` 里的偏移是否等于自己期望的写入位置（`reshandler.cpp::downloadChunk`），
+  对不上就整体作废并提示"下载中断：数据错位"，宁可重下也不把错位数据写进文件。
+
+**分享语义也一起修了**。原 `shareFile` 是把整个文件转发给接收方客户端，由**客户端**写到
+`./userdata/<自己>/` 下——可网盘的数据其实在**服务端**，所以对方登录后在自己网盘里根本看不到
+被分享的文件（一个真实的功能缺陷，不是理论问题）。现在改为服务端侧拷贝：
+
+```cpp
+// Server/msghandler.cpp::shareFile()
+QFile::copy(strSrcPath, strDstPath);          // 服务端直接复制到对方的用户目录
+// 再用 CHAT_RESEND 推一条 "[系统] xxx 向您分享了文件 yyy，已存入您的网盘"
+// 对方不在线时这条通知走 9.7 的离线消息通道
+```
+
+同名文件会自动改名成 `名字(1).后缀`，最多重试 1000 次；分享给不存在的用户直接失败。
+
+**这一项的取舍与遗留**：
+
+- 每个连接同时只允许一个上传会话（`MsgHandler` 里的 `m_uploadFile` / `m_uploadOffset` 是单份状态），
+  多文件并发上传需要改成 `QMap<QString, UploadSession>`；
+- 分片大小先写死 256 KB（`FILE_CHUNK_SIZE`），没有做慢速网络下的自适应；
+- 服务端校验失败后只删 `.part`、不主动通知客户端"从零重传"，由客户端下次握手时发现断点为 0。
+
+### 9.10 测试脚本与验证方式
 
 `tests/` 下的脚本**手工构造 PDU 字节流**，不依赖 GUI，可直接复现上述修复：
 
@@ -699,13 +795,28 @@ Chat* Friend::openChat(const QString& strPeerName)
 | `tests/test_protocol.ps1` | 粘包（两包一次写）、半包（40+36 分两次写）、非法包长（10 字节）、超大包长（100MB）、异常后服务存活 | 6 / 6 通过 |
 | `tests/test_heartbeat.ps1` | 心跳应答、重复登录互踢、异常掉线 35s 超时回收 | 8 / 8 通过 |
 | `tests/test_security.ps1` | SQL 注入被拒、口令哈希格式、错误口令、路径越权（列目录 / mkdir，并验证未落盘）、合法路径回归、历史明文自动升级 | 14 / 14 通过 |
-| `tests/test_auth.ps1` | 未登录调用业务接口被拒、冒名聊天 / 加好友 / 删好友 / 查好友列表被拒、合法操作未误杀；互踢后 `online` 仍为 1、唯一连接断开后归 0 | 18 / 18 通过 |
+| `tests/test_auth.ps1` | 未登录调用业务接口被拒、冒名聊天 / 加好友 / 删好友 / 查好友列表被拒、合法操作未误杀；互踢后 `online` 仍为 1、唯一连接断开后归 0；空用户名 / 空口令被拒 | 21 / 21 通过 |
 | `tests/test_offline.ps1` | 离线落库、登录补发顺序（`LOGIN_RESPOND` 在前）、补发后已读、重新登录不重发、在线直投不落库、冒名发送被拒 | 17 / 17 通过 |
+| `tests/test_chunk.ps1` | 3 MB 文件分片上传并核对落盘 MD5、传一半后握手拿到断点并续传、分片偏移错乱被丢弃、MD5 不符被拒并清理 `.part`、下载逐片接收核对、从 100 KB 处续传下载、分享=服务端拷贝 + 通知 | 37 / 37 通过 |
 
 > `test_protocol.ps1` 的用例需要**先登录**才能触发业务应答（服务端已加登录态校验），
 > 脚本里封装了 `New-AuthenticatedClient`。
 
-### 9.10 已知取舍（暂不处理）
+排错时可以给服务端设环境变量 `IM_SERVER_LOG`，把 `qDebug()` 输出落盘——
+服务端在 Windows 上是 GUI 子系统程序，控制台里看不到任何输出：
+
+```powershell
+$env:IM_SERVER_LOG = "D:\QTdm\build-console\Server\dbg.log"
+```
+
+> 写测试脚本时踩到一个 PowerShell 的坑：函数里 `return (New-Object byte[] 64)` 会把数组**展开**成
+> 64 个独立输出，调用方拿到的其实是 `Object[]`；再传给形参类型为 `[byte[]]` 的函数时会先做一次
+> 拷贝转换，函数内的就地修改全部丢失——表现为服务端收到的 `caData` 全是 0，登录被判成"未登录"。
+> 改成 `return ,(New-Object byte[] 64)` 才能把整个数组当**单个对象**返回。
+> 这类"测试端自己造出来的假故障"最费时间：当时一路怀疑服务端的收包状态机，实际是测试脚本
+> 压根没把用户名写进 `caData`。教训是先确认"发出去的字节真的是我以为的那串"，再怀疑协议实现。
+
+### 9.11 已知取舍（暂不处理）
 
 - 未引入单元测试框架，验证方式为协议级脚本 + 双客户端手动联调；
 - 服务端无界面，运行日志依赖 `qDebug()` 输出；
@@ -737,6 +848,10 @@ Chat* Friend::openChat(const QString& strPeerName)
 | 离线消息 / 投递语义 | 对方不在线时落 `message` 表，登录后排队补发；"先查未读 → 下发 → 标记已读"的 at-least-once 取舍 |
 | 客户端多会话 | `QMap<QString, Chat*>` 按好友维度维护窗口，会话对象只在创建时赋值，避免串消息 |
 | 弱指针防悬空 | `QPointer<MyTcpSocket>` + `Qt::QueuedConnection` 排队回调，跨事件循环访问已析构对象时自动判空 |
+| 分片传输 / 背压 | 256 KB 固定分片 + 偏移序号；下行由服务端按 `bytesToWrite() < 1 MB` 水位主动推，`bytesWritten` 驱动形成反压，不需要逐片 ack |
+| 断点续传 | `.part` 临时文件 + 握手时回传已落盘大小；续传必须把已落盘前缀重新喂给 `QCryptographicHash`，否则整文件哈希不成立 |
+| 数据完整性校验 | 客户端流式算整文件 MD5（内存占用与文件大小无关），服务端边收边算，`FINISH` 时比对长度 + MD5，不一致就删掉半成品 |
+| 有界内存的大文件处理 | 两个方向都按 256 KB 分块读写，任何时刻内存里只有一个分片，不再 `readAll()` 整个文件 |
 
 ---
 
