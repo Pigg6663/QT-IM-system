@@ -365,8 +365,10 @@ bool operateDB::handleDelFriend(const char *caCurName, const char *caTarName)
 
 // ---------------------------------------------------------------
 // 离线消息：对方不在线时先落库，等其登录后再补发。
-// 只保证"不丢"，不保证严格一次投递：先查出未读、推送成功后才标记已读，
+// 只保证"不丢"，不保证严格一次投递：先查出未读、推送进 socket 之后才标记已读，
 // 万一服务端在两者之间崩溃，用户会重复收到一条（可接受，优于丢消息）。
+// 注意这里没有应用层 ACK，"推送成功"只能以 write() 交给 socket 写缓冲为准；
+// 要做到"客户端真正收到才标记"，得再加一条回执消息，这一版不做。
 // ---------------------------------------------------------------
 bool operateDB::handleSaveOfflineMsg(const QString& strSender,
                                      const QString& strReceiver,
@@ -396,7 +398,7 @@ bool operateDB::handleSaveOfflineMsg(const QString& strSender,
     return true;
 }
 
-QList<operateDB::OfflineMsg> operateDB::handleTakeOfflineMsgs(const QString& strReceiver)
+QList<operateDB::OfflineMsg> operateDB::handlePickOfflineMsgs(const QString& strReceiver)
 {
     QList<OfflineMsg> res;
     if (strReceiver.isEmpty())
@@ -416,22 +418,27 @@ QList<operateDB::OfflineMsg> operateDB::handleTakeOfflineMsgs(const QString& str
         return res;
     }
 
-    QList<qint64> ids;
     while (q.next())
     {
         OfflineMsg msg;
-        ids.append(q.value(0).toLongLong());
+        msg.llId       = q.value(0).toLongLong();
         msg.strSender  = q.value(1).toString();
         msg.strContent = q.value(2).toString();
         res.append(msg);
     }
 
+    qDebug() << "取出离线消息" << res.size() << "条 用户" << strReceiver;
+    return res;
+}
+
+bool operateDB::handleMarkOfflineMsgsRead(const QList<qint64>& ids)
+{
     if (ids.isEmpty())
     {
-        return res;
+        return true;
     }
 
-    // 批量标记已读：占位符全部由代码生成，不拼用户数据
+    // 批量标记：占位符全部由代码生成，不拼用户数据
     QStringList placeholders;
     for (int i = 0; i < ids.size(); ++i)
     {
@@ -447,10 +454,9 @@ QList<operateDB::OfflineMsg> operateDB::handleTakeOfflineMsgs(const QString& str
     if (!up.exec())
     {
         qDebug() << "标记离线消息已读失败" << up.lastError().text();
+        return false;
     }
-
-    qDebug() << "取出离线消息" << res.size() << "条 用户" << strReceiver;
-    return res;
+    return true;
 }
 
 operateDB::operateDB(QObject *parent) : QObject(parent)

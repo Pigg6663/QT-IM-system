@@ -275,31 +275,65 @@ void MyTcpSocket::pushOfflineMessages()
         return;
     }
 
-    const QList<operateDB::OfflineMsg> msgs =
-            operateDB::getInstance().handleTakeOfflineMsgs(m_strLoginName);
-    if (msgs.isEmpty())
-    {
-        return;
-    }
-
     const QByteArray me = m_strLoginName.toUtf8();
-    for (const operateDB::OfflineMsg& msg : msgs)
+    int iTotalPushed = 0;
+
+    // 一批最多 kMaxOfflineBatch 条，取空为止；积压太多时分批喂，避免一次把
+    // 上万条塞进 socket 写缓冲。每批都是"先写、写成功才标记已读"。
+    while (true)
     {
-        const QByteArray content = msg.strContent.toUtf8();
-        const QByteArray sender  = msg.strSender.toUtf8();
+        const QList<operateDB::OfflineMsg> msgs =
+                operateDB::getInstance().handlePickOfflineMsgs(m_strLoginName);
+        if (msgs.isEmpty())
+        {
+            break;
+        }
 
-        PDU* pdu = mkPDU(uint(content.size()));
-        pdu->uiType = ENUM_TYPE_OFFLINE_MSG_RESEND;
-        // caData 两个定长槽位，按实际长度拷贝，剩余部分由 mkPDU 归零
-        memcpy(pdu->caData, sender.constData(), size_t(qMin(sender.size(), 32)));
-        memcpy(pdu->caData + 32, me.constData(), size_t(qMin(me.size(), 32)));
-        memcpy(pdu->caMsg, content.constData(), size_t(content.size()));
+        QList<qint64> ids;
+        for (const operateDB::OfflineMsg& msg : msgs)
+        {
+            const QByteArray content = msg.strContent.toUtf8();
+            const QByteArray sender  = msg.strSender.toUtf8();
 
-        this->write((char*)pdu, pdu->uiTotalLen);
-        free(pdu);
+            PDU* pdu = mkPDU(uint(content.size()));
+            pdu->uiType = ENUM_TYPE_OFFLINE_MSG_RESEND;
+            // caData 两个定长槽位，按实际长度拷贝，剩余部分由 mkPDU 归零
+            memcpy(pdu->caData, sender.constData(), size_t(qMin(sender.size(), 32)));
+            memcpy(pdu->caData + 32, me.constData(), size_t(qMin(me.size(), 32)));
+            memcpy(pdu->caMsg, content.constData(), size_t(content.size()));
+
+            this->write((char*)pdu, pdu->uiTotalLen);
+            free(pdu);
+            ids.append(msg.llId);
+        }
+
+        // 连接已经断了就别标记：这几条留给下次登录重新补发
+        if (this->state() != QAbstractSocket::ConnectedState)
+        {
+            qWarning() << "补发期间连接已断开，本批不标记已读:" << ids.size();
+            break;
+        }
+
+        if (!operateDB::getInstance().handleMarkOfflineMsgsRead(ids))
+        {
+            // 标记失败就停手：否则下一轮又会把同一批取出来，变成死循环
+            qWarning() << "标记离线消息已读失败，停止补发，剩余留给下次登录";
+            break;
+        }
+        iTotalPushed += msgs.size();
+
+        // 写缓冲堆太多就先停下，剩下的下次登录接着补（is_read 仍是 0）
+        if (this->bytesToWrite() > 4 * 1024 * 1024)
+        {
+            qDebug() << "离线消息积压较多，剩余部分留待下次登录补发";
+            break;
+        }
     }
 
-    qDebug() << "已补发离线消息" << msgs.size() << "条 ->" << m_strLoginName;
+    if (iTotalPushed > 0)
+    {
+        qDebug() << "已补发离线消息" << iTotalPushed << "条 ->" << m_strLoginName;
+    }
 }
 
 // ---------------------------------------------------------------
@@ -322,7 +356,17 @@ void MyTcpSocket::tryStartDownload()
     m_downloadFile.reset(new QFile(strPath));
     if (!m_downloadFile->open(QIODevice::ReadOnly))
     {
-        qWarning() << "下载打开文件失败:" << strPath;
+        // 握手已经回过 ok=true 了（文件在、大小也对），这里打不开多半是权限或
+        // 句柄被占。补一条失败收尾，否则客户端会一直等分片等不到头。
+        qWarning() << "下载打开文件失败:" << strPath << m_downloadFile->errorString();
+        m_downloadFile.reset();
+
+        PDU* respdu = mkPDU();
+        respdu->uiType = ENUM_TYPE_DOWNLOAD_FILE_FINISH_RESPOND;
+        bool ok = false;
+        memcpy(respdu->caData + DL_RESP_OK_POS, &ok, sizeof(bool));
+        this->write((char*)respdu, respdu->uiTotalLen);
+        free(respdu);
         return;
     }
     m_downloadHash.reset(new QCryptographicHash(QCryptographicHash::Md5));

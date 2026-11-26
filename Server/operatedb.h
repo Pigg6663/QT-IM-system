@@ -13,6 +13,7 @@ class operateDB : public QObject
 public:
     // 离线消息：对方不在线时落库，其登录后补发
     struct OfflineMsg {
+        qint64  llId = 0;   // 主键，补发成功后按它批量标记已读
         QString strSender;
         QString strContent;
     };
@@ -36,8 +37,11 @@ public:
     bool handleSaveOfflineMsg(const QString& strSender,
                               const QString& strReceiver,
                               const QString& strContent);
-    // 取出并标记已读（按时间正序，一次最多 kMaxOfflineBatch 条）
-    QList<OfflineMsg> handleTakeOfflineMsgs(const QString& strReceiver);
+    // 取出一批未读消息（按时间正序，一次最多 kMaxOfflineBatch 条），只读不改状态。
+    // 标记已读要等真正写进 socket 之后由调用方发起，见 handleMarkOfflineMsgsRead。
+    QList<OfflineMsg> handlePickOfflineMsgs(const QString& strReceiver);
+    // 把一批消息标记为已读（下发成功后调用）
+    bool handleMarkOfflineMsgsRead(const QList<qint64>& ids);
 
     // ---- 密码加盐哈希 ----
     // 生成 32 位 hex 随机盐（16 字节随机数）
